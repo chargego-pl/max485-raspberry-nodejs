@@ -68,17 +68,35 @@ sudo systemctl restart touchapp-control touchapp
 
 ### Priorytet ⭐⭐⭐ (krytyczne)
 
-- [ ] **A. `port.Flush()` przed każdym `sendModbusRequest`**
+- [x] ~~**A. `port.Flush()` przed każdym `sendModbusRequest`**~~ — **REVERTED**
   - **Plik:** `go/main.go:131` (początek `sendModbusRequest`)
   - **Zmiana:** dodać `d.port.Flush()` jako pierwszą linię metody
   - **Motywacja:** zalegające bajty w RX bufferze z poprzedniego cyklu
     (np. response który nadszedł po timeout) mieszają się z aktualną
     response → "invalid slave ID: got X, expected Y" lub "invalid
     response length"
-  - **Spodziewany efekt:** ~80% spadek tych dwóch typów błędów
-  - **Acceptance:** journalctl po 30 min ma <20% errorów względem baseline
-  - **Wersja docelowa:** v3.0.3
-  - **Status:** PENDING
+  - **Wynik testu (2026-05-21, branch `fix/flush-before-send`):**
+    | Metryka | Baseline (v3.0.2, 22 min) | Po fix A (21 min) | Zmiana |
+    |---|---|---|---|
+    | touch-control errors | 17 | 93 | **+447%** |
+    | invalid response length | 12 | 74 | +517% |
+    | invalid slave ID | 5 | 18 | +260% |
+    | touchapp errors | 33 | 120 | +264% |
+  - **Hipoteza dlaczego pogorszyło:** `tarm/serial.Flush()` wywołuje
+    `tcflush(TCIOFLUSH)` — flushuje OBA kierunki. To prawdopodobnie
+    obcina in-flight transmisję (kernel UART tx buffer ma 64-byte FIFO
+    który shift-uje przez ~7ms przy 9600 baud). Jeśli następne wywołanie
+    Flush dzieje się gdy poprzednia response ledwo wpadła do RX FIFO,
+    tcflush(TCIFLUSH) ją wymiata zanim Read zdąży skopiować. Efekt
+    netto: WIĘCEJ partial responses zamiast mniej.
+  - **Implication:** ten fix wymaga **selektywnego flush'a tylko input
+    buffera** (`tcflush(TCIFLUSH)` zamiast `TCIOFLUSH`). `tarm/serial`
+    nie wystawia tej granularności — wymaga przejścia na
+    `go.bug.st/serial` która ma `ResetInputBuffer()` (tylko RX).
+  - **Re-plan:** Fix A musi być powiązany z migracją na `go.bug.st/serial`
+    (razem z fix B/E). Pojedynczy fix Flush jest niemożliwy do
+    zaimplementowania bezpiecznie z aktualnym tarm/serial.
+  - **Status:** REVERTED — wymaga przepisania na inną bibliotekę serial
 
 - [ ] **E. `flock()` na otwartym serial port**
   - **Plik:** `go/main.go:50` (po `serial.OpenPort`)
