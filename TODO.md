@@ -217,7 +217,8 @@ sudo systemctl restart touchapp-control touchapp
 
 ## Meta-lessons learned
 
-Po dwóch revertach (A i C) z dramatycznymi regresjami:
+Po **trzech** revertach (A, C, oraz pro.js→IPC w elinetouch) z dramatycznymi
+regresjami w produkcji:
 
 1. **Każdy "tylko mały fix" w hot path Modbus może mieć non-obvious
    konsekwencje.** Fix C był zmianą stringa — i wywołał 10× regresję
@@ -247,9 +248,41 @@ Po dwóch revertach (A i C) z dramatycznymi regresjami:
    ich naprawa.
 
 6. **Wszystkie fixy są PO TYM JAK coś już poszło źle** (timeout,
-   corruption, exception). Większy zysk byłby z prevention:
-   `services/pro.js` używający IPC zamiast direct serial → 50%
-   mniej ruchu na busie → odpowiednio mniej errorów per minute.
+   corruption, exception). Większy zysk byłby z prevention.
+
+7. **(NOWE po 3-cim revercie)** Fix pro.js→IPC był koncepcyjnie poprawny
+   — eliminował podwójnego ownera serial port (lsof potwierdził). ALE:
+   spowodował 9× wzrost timeoutów. Diagnoza: pro.js wcześniej miał
+   **własną równoległą queue** (chaotic parallel throughput), teraz wszystko
+   serializuje się przez jedną queue touch-control (SLEEP_MS=500 + Modbus
+   call) → metrics scrape + mqtt report + monitor + IPC callers stoją
+   w kolejce → 5s read timeouts strzelają.
+   **Wniosek:** nie istnieje "prosty" fix. Każda strukturalna zmiana
+   ujawnia inny bottleneck. System jest w stanie nasycenia magistrali —
+   wszelkie modyfikacje timing/serialization wpychają go głębiej.
+
+8. **Najpilniejsza prawdziwa potrzeba:** redukcja LICZBY operacji na busie,
+   nie ich naprawa. Plan na osobną sesję:
+   - **Shared cache w touch-control:** monitor poll co X, cached state,
+     IPC clients dostają cached state bez nowego Modbus call dopóki
+     świeży (np. TTL 2s dla statuses, 10s dla power, 30s dla LED).
+   - **Tuning polling intervals:** metrics scrape rzadziej (co 30s
+     zamiast 5s), mqtt report rzadziej (co 60s zamiast 15s).
+   - **DOPIERO POTEM** spadek baseline → nowe pole do prób fix lib.
+
+9. **70/h errorów na v3.0.2 to nowy normal.** System operacyjnie działa
+   (intent ACK lecą, MQTT trzyma się, UI responsywny). Retry logic
+   maskuje większość. Te errors są **wskaźnikiem nasycenia bus**, nie
+   service degradation z perspektywy użytkownika.
+
+## Wnioski na dalszą pracę
+
+**Nie ruszać biblioteki przed redukcją base load na magistrali.** Lib jest
+napięta — każda zmiana destabilizuje. Najpierw:
+1. Shared cache w touch-control (elinetouch, osobny task)
+2. Tune polling intervals (elinetouch)
+3. **Dopiero potem** wracać do fixów lib (A z `go.bug.st/serial`, B drain,
+   E flock — wszystkie razem jako v3.1.0)
 
 ## Pliki referencyjne
 
