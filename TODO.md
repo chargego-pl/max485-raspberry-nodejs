@@ -138,18 +138,39 @@ sudo systemctl restart touchapp-control touchapp
 
 ### Priorytet ⭐ (poprawa diagnostyki)
 
-- [ ] **C. Rozróżnić timeout od corrupted response**
+- [x] ~~**C. Rozróżnić timeout od corrupted response**~~ — **REVERTED**
   - **Plik:** `go/main.go:181-183`
   - **Zmiana:** jeśli `totalRead == 0` → `"MODBUS_TIMEOUT: no response from
     slave N"` zamiast generic "invalid response length"
-  - **Motywacja:** modbus-server.js `_withReconnect` ma osobną logikę dla
-    timeout vs corruption. Obecnie obie idą tą samą ścieżką z 300ms sleep
-    między retry — przy genuine timeout to za krótkie, przy corruption za
-    długie
-  - **Acceptance:** żadne "got 0, expected N" w nowym logu, zamiast tego
-    `MODBUS_TIMEOUT`
-  - **Wersja docelowa:** v3.0.5
-  - **Status:** PENDING
+  - **Wynik testu (2026-05-21, branch `fix/timeout-error-message`):**
+    | Metryka | Baseline (9.5 min v3.0.2) | Po Fix C (10.5 min) | Zmiana |
+    |---|---|---|---|
+    | touch-control errors | 11 | 121 | **+1000%** |
+    | invalid response length | 8 | 88 | +1000% |
+    | invalid slave ID | 3 | 24 | +700% |
+    | MODBUS_TIMEOUT (nowy) | 0 | 8 | nowy |
+    | touchapp errors | 15 | 152 | +913% |
+    | touchapp.service | active | **FAILED** (start-limit) | ALARM |
+  - **Diagnoza dlaczego pogorszyło (mimo że to "tylko zmiana stringa"):**
+    Po zmianie komunikatu, `modbus-server.js _withReconnect` regex
+    `/file already closed|EBADF|ENOENT|timeout/i` zaczął matchować
+    `MODBUS_TIMEOUT` → kick'nął retry logic (3 attempts × 300ms sleep).
+    Każdy timeout to teraz **3× więcej calls na busie**:
+    - przed: 1 call → "invalid response length: got 0" → throw, idziemy dalej
+    - po: 1 call → 5s wait → "MODBUS_TIMEOUT" → matchuje retry regex
+      → sleep 300ms → call 2 (timeout 5s) → sleep 300ms → call 3 (5s) → throw
+    - **15.6s + 3 calls** zamiast 5s + 1 call
+    Skutek: bus saturated, każdy timeout blokuje queue na ~15s, w międzyczasie
+    inne slave'y nie są odpytywane → ich own pollery (touchapp pro.js, metrics.js)
+    też timeoutują → kaskada, touchapp wpada w restart-loop.
+  - **Implication:** **fix biblioteki SAM nie wystarczy**. Musi być
+    skoordynowany z modbus-server.js:
+    - Wariant A: `MODBUS_TIMEOUT` to "give up, throw immediately, no retry"
+      (slave realnie milczał 5s — dodatkowe próby tylko marnują czas)
+    - Wariant B: dla MODBUS_TIMEOUT retry max 1× zamiast 3, bez sleep
+    - Najlepiej: typed error class zamiast regex matching w error message
+  - **Status:** REVERTED — wymaga skoordynowanej zmiany w
+    `elinetouch/src/control/modbus-server.js` i `services/pro.js`
 
 - [ ] **D. Parse Modbus exception responses**
   - **Plik:** `go/main.go:131-203`
@@ -193,6 +214,42 @@ sudo systemctl restart touchapp-control touchapp
       gdy Go GC przeniósł obiekt. Plus unifikacja error format w
       `ReadCoilsJS` (był napi error object, teraz string "Error: ..."
       jak inne metody).
+
+## Meta-lessons learned
+
+Po dwóch revertach (A i C) z dramatycznymi regresjami:
+
+1. **Każdy "tylko mały fix" w hot path Modbus może mieć non-obvious
+   konsekwencje.** Fix C był zmianą stringa — i wywołał 10× regresję
+   przez interakcję z regex w modbus-server.js. Lib + caller są
+   silnie sprzężone, separation of concerns iluzoryczna.
+
+2. **Hot path obecnie operuje na granicy stabilności.** Każde
+   dodatkowe obciążenie (więcej retries, dodatkowy syscall flush,
+   więcej delays) wpycha system w spiralę: więcej calls → więcej
+   timeouts → więcej retries → kaskada → touchapp restart-loop.
+
+3. **Pojedyncze fixy w libie wymagają skoordynowanej zmiany u
+   caller'a.** Następne iteracje muszą obejmować JEDNOCZEŚNIE:
+   - lib change (np. typed errors)
+   - modbus-server.js change (retry policy per error type)
+   - PR ze zmianą obu repos, deploy razem, rollback razem
+
+4. **Workflow "1 fix → test → decide" jest pomocny ale nie wystarcza
+   gdy zmiana jest cross-repo.** Trzeba przejść na "feature flag
+   + ramp + rollback per slave" lub po prostu większe atomy zmian
+   (cały coordinated fix razem).
+
+5. **Magistrala jest bardziej fragile niż zakładaliśmy.** Te ~70/h
+   errorów to nie "bug do naprawy" — to **wskaźnik nasycenia bus'a**.
+   Każda dodatkowa transmisja zwiększa szansę kolizji. Pierwszą rzeczą
+   do zrobienia powinno być **zmniejszenie liczby transmisji**, nie
+   ich naprawa.
+
+6. **Wszystkie fixy są PO TYM JAK coś już poszło źle** (timeout,
+   corruption, exception). Większy zysk byłby z prevention:
+   `services/pro.js` używający IPC zamiast direct serial → 50%
+   mniej ruchu na busie → odpowiednio mniej errorów per minute.
 
 ## Pliki referencyjne
 
