@@ -60,8 +60,24 @@ static void create_function(napi_env env, napi_value exports, const char* name, 
 import "C"
 import (
     "encoding/json"
+    "runtime/cgo"
     "unsafe"
 )
+
+// readDevice extracts the *ModbusDevice from a napi external value.
+// The external stores a pointer to a cgo.Handle (allocated via C.malloc)
+// rather than a raw Go pointer — Go's GC can move/relocate Go objects,
+// which invalidates raw pointers held on the C side and was the cause
+// of intermittent SIGSEGV in long-running processes (cgo rules forbid
+// storing Go pointers in C memory).
+//
+// See https://pkg.go.dev/runtime/cgo#Handle.
+func readDevice(env C.napi_env, jsExternal C.napi_value) *ModbusDevice {
+    var handlePtr unsafe.Pointer
+    C.napi_get_value_external(env, jsExternal, &handlePtr)
+    h := *(*cgo.Handle)(handlePtr)
+    return h.Value().(*ModbusDevice)
+}
 
 //export NewModbusDeviceJS
 func NewModbusDeviceJS(env C.napi_env, info C.napi_callback_info) C.napi_value {
@@ -91,12 +107,17 @@ func NewModbusDeviceJS(env C.napi_env, info C.napi_callback_info) C.napi_value {
         return C.create_error(env, errStr)
     }
 
-    // Tworzymy wskaźnik do urządzenia w pamięci C
-    devicePtr := C.malloc(C.size_t(unsafe.Sizeof(uintptr(0))))
-    *(*unsafe.Pointer)(devicePtr) = unsafe.Pointer(device)
+    // Zapakuj *ModbusDevice w cgo.Handle (Go 1.17+) — Go GC nie ruszy
+    // obiektu dopóki handle żyje, a C trzyma tylko opaque uintptr.
+    // Sam handle jest kopiowany do C-allocated pamięci żeby napi-external
+    // mógł go bezpiecznie przechowywać przez cały lifetime obiektu po
+    // stronie JS.
+    h := cgo.NewHandle(device)
+    handlePtr := C.malloc(C.size_t(unsafe.Sizeof(cgo.Handle(0))))
+    *(*cgo.Handle)(handlePtr) = h
 
     var result C.napi_value
-    C.napi_create_external(env, devicePtr, nil, nil, &result)
+    C.napi_create_external(env, handlePtr, nil, nil, &result)
     return result
 }
 
@@ -106,9 +127,7 @@ func ReadCoilsJS(env C.napi_env, info C.napi_callback_info) C.napi_value {
     var argc C.size_t = 4
     C.napi_get_cb_info(env, info, &argc, &args[0], nil, nil)
 
-    var devicePtr unsafe.Pointer
-    C.napi_get_value_external(env, args[0], &devicePtr)
-    device := (*ModbusDevice)((*(*unsafe.Pointer)(devicePtr)))
+    device := readDevice(env, args[0])
 
     slaveID := C.get_uint8(env, args[1])
     startAddr := C.get_uint16(env, args[2])
@@ -116,9 +135,14 @@ func ReadCoilsJS(env C.napi_env, info C.napi_callback_info) C.napi_value {
 
     values, err := device.ReadCoils(byte(slaveID), uint16(startAddr), uint16(count))
     if err != nil {
-        errStr := C.CString(err.Error())
+        // Spójność z pozostałymi *JS — zwracamy string "Error: ..."
+        // żeby index.js (`result.startsWith('Error:')`) nie crashował przy
+        // Modbus timeoutach.
+        errStr := C.CString("Error: " + err.Error())
         defer C.free(unsafe.Pointer(errStr))
-        return C.create_error(env, errStr)
+        var result C.napi_value
+        C.napi_create_string_utf8(env, errStr, C.size_t(len("Error: "+err.Error())), &result)
+        return result
     }
 
     jsonData, _ := json.Marshal(values)
@@ -135,9 +159,7 @@ func ReadDiscreteInputsJS(env C.napi_env, info C.napi_callback_info) C.napi_valu
     var argc C.size_t = 4
     C.napi_get_cb_info(env, info, &argc, &args[0], nil, nil)
 
-    var devicePtr unsafe.Pointer
-    C.napi_get_value_external(env, args[0], &devicePtr)
-    device := (*ModbusDevice)((*(*unsafe.Pointer)(devicePtr)))
+    device := readDevice(env, args[0])
 
     slaveID := C.get_uint8(env, args[1])
     startAddr := C.get_uint16(env, args[2])
@@ -166,9 +188,7 @@ func ReadHoldingRegistersJS(env C.napi_env, info C.napi_callback_info) C.napi_va
     var argc C.size_t = 4
     C.napi_get_cb_info(env, info, &argc, &args[0], nil, nil)
 
-    var devicePtr unsafe.Pointer
-    C.napi_get_value_external(env, args[0], &devicePtr)
-    device := (*ModbusDevice)((*(*unsafe.Pointer)(devicePtr)))
+    device := readDevice(env, args[0])
 
     slaveID := C.get_uint8(env, args[1])
     startAddr := C.get_uint16(env, args[2])
@@ -197,9 +217,7 @@ func ReadInputRegistersJS(env C.napi_env, info C.napi_callback_info) C.napi_valu
     var argc C.size_t = 4
     C.napi_get_cb_info(env, info, &argc, &args[0], nil, nil)
 
-    var devicePtr unsafe.Pointer
-    C.napi_get_value_external(env, args[0], &devicePtr)
-    device := (*ModbusDevice)((*(*unsafe.Pointer)(devicePtr)))
+    device := readDevice(env, args[0])
 
     slaveID := C.get_uint8(env, args[1])
     startAddr := C.get_uint16(env, args[2])
@@ -228,9 +246,7 @@ func WriteCoilJS(env C.napi_env, info C.napi_callback_info) C.napi_value {
     var argc C.size_t = 4
     C.napi_get_cb_info(env, info, &argc, &args[0], nil, nil)
 
-    var devicePtr unsafe.Pointer
-    C.napi_get_value_external(env, args[0], &devicePtr)
-    device := (*ModbusDevice)((*(*unsafe.Pointer)(devicePtr)))
+    device := readDevice(env, args[0])
 
     slaveID := C.get_uint8(env, args[1])
     coilAddr := C.get_uint16(env, args[2])
@@ -256,9 +272,7 @@ func WriteRegisterJS(env C.napi_env, info C.napi_callback_info) C.napi_value {
     var argc C.size_t = 4
     C.napi_get_cb_info(env, info, &argc, &args[0], nil, nil)
 
-    var devicePtr unsafe.Pointer
-    C.napi_get_value_external(env, args[0], &devicePtr)
-    device := (*ModbusDevice)((*(*unsafe.Pointer)(devicePtr)))
+    device := readDevice(env, args[0])
 
     slaveID := C.get_uint8(env, args[1])
     regAddr := C.get_uint16(env, args[2])
@@ -282,9 +296,7 @@ func WriteMultipleCoilsJS(env C.napi_env, info C.napi_callback_info) C.napi_valu
     var argc C.size_t = 4
     C.napi_get_cb_info(env, info, &argc, &args[0], nil, nil)
 
-    var devicePtr unsafe.Pointer
-    C.napi_get_value_external(env, args[0], &devicePtr)
-    device := (*ModbusDevice)((*(*unsafe.Pointer)(devicePtr)))
+    device := readDevice(env, args[0])
 
     slaveID := C.get_uint8(env, args[1])
     startAddr := C.get_uint16(env, args[2])
@@ -320,9 +332,7 @@ func WriteMultipleRegistersJS(env C.napi_env, info C.napi_callback_info) C.napi_
     var argc C.size_t = 4
     C.napi_get_cb_info(env, info, &argc, &args[0], nil, nil)
 
-    var devicePtr unsafe.Pointer
-    C.napi_get_value_external(env, args[0], &devicePtr)
-    device := (*ModbusDevice)((*(*unsafe.Pointer)(devicePtr)))
+    device := readDevice(env, args[0])
 
     slaveID := C.get_uint8(env, args[1])
     startAddr := C.get_uint16(env, args[2])
@@ -357,12 +367,14 @@ func CloseJS(env C.napi_env, info C.napi_callback_info) C.napi_value {
     var argc C.size_t = 1
     C.napi_get_cb_info(env, info, &argc, &args[0], nil, nil)
 
-    var devicePtr unsafe.Pointer
-    C.napi_get_value_external(env, args[0], &devicePtr)
-    device := (*ModbusDevice)((*(*unsafe.Pointer)(devicePtr)))
+    var handlePtr unsafe.Pointer
+    C.napi_get_value_external(env, args[0], &handlePtr)
+    h := *(*cgo.Handle)(handlePtr)
+    device := h.Value().(*ModbusDevice)
 
     device.Close()
-    C.free(devicePtr)
+    h.Delete()
+    C.free(handlePtr)
 
     return C.create_success(env)
 }
