@@ -178,6 +178,14 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 		time.Sleep(receiveReadDelay)
 	}
 	
+	if totalRead == 0 {
+		// Slave nie odpowiedział w ogóle (read timeout 5s lub natychmiastowy
+		// EOF z pustego bufora). Rozróżniamy to od "got X expected Y" gdzie
+		// X>0 — w tamtym przypadku to prawdziwa korupcja danych.
+		// Komunikat "MODBUS_TIMEOUT" jest matched przez modbus-server.js
+		// _withReconnect retry logic (regex /timeout/i), więc retry kick'nie.
+		return nil, fmt.Errorf("MODBUS_TIMEOUT: no response from slave %d", request[0])
+	}
 	if totalRead < expectedLength {
 		return nil, fmt.Errorf("invalid response length: got %d, expected %d", totalRead, expectedLength)
 	}
