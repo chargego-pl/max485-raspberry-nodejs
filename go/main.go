@@ -129,6 +129,15 @@ func (d *ModbusDevice) enableRX() {
 
 // sendModbusRequest sends a Modbus request and waits for response
 func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]byte, error) {
+	// Wyczyść zalegające bajty w RX/TX bufferze przed nowym cyklem.
+	// Bez tego ostatni bajt response z poprzedniego cyklu (który nadszedł
+	// po timeout=5s) miesza się z nową response → "invalid slave ID:
+	// got X, expected Y" lub "invalid response length".
+	// tarm/serial.Flush() wywołuje tcflush(TCIOFLUSH) — oba kierunki.
+	if err := d.port.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush port before send: %v", err)
+	}
+
 	// Add CRC to request
 	crc := calculateCRC(request)
 	request = append(request, byte(crc&0xFF), byte(crc>>8))
