@@ -83,6 +83,11 @@ func NewModbusDevice(portName string, baudRate int, dePin, rePin int) (*ModbusDe
 
 // Close closes the Modbus device
 func (d *ModbusDevice) Close() {
+	// STABILITY: wymuś stan RX (driver disabled, receiver enabled) przed close.
+	// Bez tego po crash/SIGKILL pin DE pozostawałby HIGH → ISL napędza bus
+	// stale → bus zablokowany dla innych masterów. Kolejność jak w enableRX().
+	d.rePin.Low()
+	d.dePin.Low()
 	if d.port != nil {
 		d.port.Close()
 	}
@@ -105,25 +110,26 @@ func calculateCRC(data []byte) uint16 {
 	return crc
 }
 
-// enableTX enables RS485 transmit mode
+// enableTX enables RS485 transmit mode.
+// STABILITY: kolejność wybrana tak by NIGDY nie wpaść w stan (/RE=1, DE=0),
+// który wprowadza ISL43485IBZ w shutdown mode (datasheet: ≥300 ns próg,
+// ~3 µs exit time). Przejście przez stan "DE=1, /RE=0" (oba enabled, echo)
+// jest bezpieczne — driver nadaje, receiver słyszy swoje TX (irrelevant).
 func (d *ModbusDevice) enableTX() {
-	// For ISL43485IBZ:
-	// DE must be HIGH to enable transmission
-	// RE must be HIGH to disable reception
-	d.rePin.High()
+	d.dePin.High() // DE=1, /RE=0 → TX+RX echo (bezpieczne, NIE shutdown)
 	time.Sleep(gpioSwitchDelay)
-	d.dePin.High()
+	d.rePin.High() // DE=1, /RE=1 → TX only (driver active, receiver off)
 	time.Sleep(gpioSwitchDelay)
 }
 
-// enableRX enables RS485 receive mode
+// enableRX enables RS485 receive mode.
+// STABILITY: kolejność jak w enableTX — najpierw /RE=0 (re-enable receiver
+// gdy driver jeszcze aktywny), potem DE=0 (driver off). NIGDY nie wpadamy
+// w shutdown (/RE=1, DE=0).
 func (d *ModbusDevice) enableRX() {
-	// For ISL43485IBZ:
-	// DE must be LOW to disable transmission
-	// RE must be LOW to enable reception
-	d.dePin.Low()
+	d.rePin.Low() // DE=1, /RE=0 → TX+RX echo
 	time.Sleep(gpioSwitchDelay)
-	d.rePin.Low()
+	d.dePin.Low() // DE=0, /RE=0 → RX only
 	time.Sleep(gpioSwitchDelay)
 }
 
