@@ -612,6 +612,16 @@ func verifyWriteEcho(op string, request, response []byte) error {
 	return nil
 }
 
+// preserveModbusException — fmt.Errorf("...: %v", err) zgubiłoby typ
+// *ModbusException (binding.go robi type assertion na *ModbusException żeby
+// zbudować structured JS error). Helper zachowuje typ jeśli wrapped.
+func preserveModbusException(prefix string, err error) error {
+	if _, ok := err.(*ModbusException); ok {
+		return err // PASS-THROUGH typed
+	}
+	return fmt.Errorf("%s: %v", prefix, err)
+}
+
 func (d *ModbusDevice) WriteCoil(slaveID byte, coilAddr uint16, value bool) error {
 	request := []byte{
 		slaveID, FCWriteSingleCoil,
@@ -623,7 +633,7 @@ func (d *ModbusDevice) WriteCoil(slaveID byte, coilAddr uint16, value bool) erro
 	}
 	response, err := d.sendModbusRequest(request, expectedResponseLength(FCWriteSingleCoil, 0))
 	if err != nil {
-		return fmt.Errorf("failed to write coil: %v", err)
+		return preserveModbusException("failed to write coil", err)
 	}
 	return verifyWriteEcho("write_coil", request, response)
 }
@@ -636,7 +646,7 @@ func (d *ModbusDevice) WriteRegister(slaveID byte, regAddr, value uint16) error 
 	}
 	response, err := d.sendModbusRequest(request, expectedResponseLength(FCWriteSingleRegister, 0))
 	if err != nil {
-		return fmt.Errorf("failed to write register: %v", err)
+		return preserveModbusException("failed to write register", err)
 	}
 	return verifyWriteEcho("write_register", request, response)
 }
@@ -658,7 +668,7 @@ func (d *ModbusDevice) WriteMultipleCoils(slaveID byte, startAddr uint16, values
 	}
 	response, err := d.sendModbusRequest(request, expectedResponseLength(FCWriteMultipleCoils, uint16(len(values))))
 	if err != nil {
-		return fmt.Errorf("failed to write multiple coils: %v", err)
+		return preserveModbusException("failed to write multiple coils", err)
 	}
 	return verifyWriteEcho("write_multiple_coils", request, response)
 }
@@ -678,7 +688,7 @@ func (d *ModbusDevice) WriteMultipleRegisters(slaveID byte, startAddr uint16, va
 	}
 	response, err := d.sendModbusRequest(request, expectedResponseLength(FCWriteMultipleRegisters, uint16(len(values))))
 	if err != nil {
-		return fmt.Errorf("failed to write multiple registers: %v", err)
+		return preserveModbusException("failed to write multiple registers", err)
 	}
 	return verifyWriteEcho("write_multiple_registers", request, response)
 }
