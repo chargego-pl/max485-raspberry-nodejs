@@ -33,6 +33,7 @@ package main
 /*
 #include <node_api.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
