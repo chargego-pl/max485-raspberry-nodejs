@@ -3,61 +3,119 @@ package main
 import (
 	"encoding/binary"
 	"encoding/hex"
-	"flag"
 	"fmt"
-	"log"
 	"os"
 	"time"
 
-	"github.com/stianeikeland/go-rpio/v4"
 	"go.bug.st/serial"
 )
 
-// N5: debug logging behind env var MAX485_DEBUG=1 (lub =hex dla pełnego dump TX/RX).
-// Domyślnie ciche — żeby produkcja nie wypluwała loga na stderr na każdą operację.
-// Touchapp-control może włączyć przez `Environment=MAX485_DEBUG=1` w drop-inie.
-var debugMode = os.Getenv("MAX485_DEBUG")
+// v4.0.0 — kompletny refactor architektoniczny. Patrz docs/...
+// max485-library.md sekcja "Changelog v4.0.0" + plan implementacji w sesji
+// 2026-05-24. Wszystkie zmiany A1–A21 wdrożone w jednym tagu.
+//
+// Mapa modułów:
+//   - main.go      — core protokół Modbus RTU + lifecycle ModbusDevice
+//   - types.go     — struct ModbusDevice + ModbusException + rpio refcount + port mutex registry
+//   - transceiver.go — Transceiver interface + 3 implementacje (ISL43485, MAX485, Auto)
+//   - stats.go     — atomic counters + snapshot API
+//   - lockfile.go  — UNIX /var/lock/LCK..* lockfile dla exclusive port access
+//   - binding.go   — cgo + napi shim (oddzielnie: każdy handler async via napi_async_work)
 
-func dbg(format string, args ...interface{}) {
-	if debugMode == "" {
+// ---------- Function codes (F5.1 / A8) ----------
+//
+// Magic numbers zniknęły z hot path'u. Tabela expectedResponseLength()
+// w jednym miejscu — łatwiej weryfikować, łatwiej dodać nowy FC.
+
+const (
+	FCReadCoils              byte = 0x01
+	FCReadDiscreteInputs     byte = 0x02
+	FCReadHoldingRegisters   byte = 0x03
+	FCReadInputRegisters     byte = 0x04
+	FCWriteSingleCoil        byte = 0x05
+	FCWriteSingleRegister    byte = 0x06
+	FCWriteMultipleCoils     byte = 0x0F
+	FCWriteMultipleRegisters byte = 0x10
+)
+
+// expectedResponseLength zwraca oczekiwaną długość ODPOWIEDZI (bez exception)
+// dla danego FC i count parametru.
+//
+// Format ogólny normalnej odpowiedzi (FC nie-exception):
+//   read*  = [slaveID, FC, byteCount, ...data..., crc_lo, crc_hi]
+//   write* = [slaveID, FC, addr_hi, addr_lo, qty_hi, qty_lo, crc_lo, crc_hi] = 8 bytes
+//
+// Exception responses zawsze = 5 bytes [slaveID, FC|0x80, exceptionCode, crc_lo, crc_hi]
+// — sprawdzane w sendModbusRequest niezależnie od tej funkcji.
+func expectedResponseLength(fc byte, count uint16) int {
+	switch fc {
+	case FCReadCoils, FCReadDiscreteInputs:
+		// 1 bit per coil, byteCount = ceil(count/8), header 3 + data + CRC 2
+		return 3 + int((count+7)/8) + 2
+	case FCReadHoldingRegisters, FCReadInputRegisters:
+		// 2 bytes per register
+		return 3 + 2*int(count) + 2
+	case FCWriteSingleCoil, FCWriteSingleRegister,
+		FCWriteMultipleCoils, FCWriteMultipleRegisters:
+		return 8
+	default:
+		// Unknown FC — najbezpieczniej fallback do minimum (exception=5).
+		return 5
+	}
+}
+
+// ---------- Timing constants ----------
+//
+// v4.0.0: zlikwidowane blind sleeps dzięki natywnemu API go.bug.st/serial
+// (Drain, SetReadTimeout, ResetInputBuffer). Pozostałe stałe są spec-driven.
+
+const (
+	// M9 / requestTimeout: overall deadline na sendModbusRequest.
+	// Typowa op @ 9600 baud = 24-32 ms. 300ms = ~10× margin dla edge cases.
+	requestTimeout = 300 * time.Millisecond
+
+	// SetReadTimeout per syscall — granularność deadline check.
+	readSliceTimeout = 50 * time.Millisecond
+)
+
+// ifg liczy 3.5-character inter-frame gap dla danego baud rate (Modbus RTU spec).
+// @ 9600/8N1: 3.5 * 11 bits / 9600 = ~4ms. @ 115200: ~0.33ms.
+// Spec: między dwoma ramkami musi być ≥3.5 char silence; nasze IFG używamy:
+//   1. Po Drain() przed enableRX() — daje slave'owi szansę zacząć nadawać.
+//   2. Po ResetInputBuffer() przed Write() — bus settle, last byte poprzedniej
+//      operacji wchodzi do bufora i jest jeszcze raz wyzerowany w razie czego.
+func (d *ModbusDevice) ifg() time.Duration {
+	if d.baudRate <= 0 {
+		return 4 * time.Millisecond // safe fallback
+	}
+	// 3.5 char * 11 bits = 38.5 bit periods. period_us = 1e6 / baud.
+	// total_us = 38_500_000 / baud.
+	us := 38500000 / d.baudRate
+	if us < 1 {
+		us = 1
+	}
+	return time.Duration(us) * time.Microsecond
+}
+
+// dbg / dbgHex — per-instance debug logging (F3.3 / A13).
+// Wcześniej globalny env var MAX485_DEBUG; teraz field na ModbusDevice
+// — dwie instancje mogą mieć różne poziomy.
+func (d *ModbusDevice) dbg(format string, args ...interface{}) {
+	if d == nil || d.debugLevel < 1 {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "[max485] "+format+"\n", args...)
 }
 
-func dbgHex(label string, data []byte) {
-	if debugMode != "hex" {
+func (d *ModbusDevice) dbgHex(label string, data []byte) {
+	if d == nil || d.debugLevel < 2 {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "[max485] %s: %s\n", label, hex.EncodeToString(data))
 }
 
-// Timing configuration.
-//
-// v4.0.0: migracja na go.bug.st/serial eliminuje większość workaroundów:
-// - byteSendDelay → 0 (port.Write blokuje do FIFO copy; Drain() później czeka na drain)
-// - postSendDelay → 0 (port.Drain() = real blocking wait na HW FIFO empty)
-// - tcflushInput → port.ResetInputBuffer() (native API)
-// - read deadline → port.SetReadTimeout(requestTimeout) (native)
-const (
-	// GPIO pin switching delays
-	gpioSwitchDelay = 1 * time.Microsecond
+// ---------- ModbusError type (legacy, zachowany dla API stability) ----------
 
-	// Pre-send GPIO settling: enableTX → tx_start
-	preSendDelay = 0 * time.Millisecond
-
-	// Pre-receive GPIO settling: enableRX → first read
-	// Slave Modbus standard: ≥3.5 char inter-frame gap (~3.6ms @ 9600).
-	// W praktyce slave odpowiada po ~5ms; my chcemy być w RX gdy zaczyna nadawać.
-	preReceiveDelay = 1 * time.Millisecond
-
-	// M9: overall I/O deadline na CAŁY sendModbusRequest (od enableTX do return).
-	// Typowa operacja @ 9600 baud = 24-32 ms. 300ms daje ~10× margin dla edge cases
-	// (slow slave processing, dribbling response). Po deadline zwracamy timeout error.
-	requestTimeout = 300 * time.Millisecond
-)
-
-// ModbusError represents possible Modbus errors
 type ModbusError int
 
 const (
@@ -68,81 +126,191 @@ const (
 	ModbusSerialError
 )
 
-// NewModbusDevice creates a new Modbus device.
+// ---------- NewModbusDevice / Close ----------
+
+// NewModbusDeviceOptions enkapsuluje wszystkie parametry konstruktora —
+// łatwiej rozszerzać bez breaking sygnatury.
 //
-// v4.0.0: użycie go.bug.st/serial.v1 API — Open(name, *Mode) zamiast OpenPort(*Config).
-// M3: defensive cleanup pattern — `success` flag + defer cleanup. Każdy step
-// init może zawieść; jeśli zawiedzie po częściowej alokacji, defer cleanup
-// zamyka co już zostało otwarte (port). rpio.Close NIE wywoływane bo process-global.
-func NewModbusDevice(portName string, baudRate int, dePin, rePin int) (*ModbusDevice, error) {
+// Transceiver budowany jest WEWNĄTRZ NewModbusDevice (po acquireRpio)
+// na podstawie TransceiverType + pinów. Dzięki temu pin operacje (Pin().Output())
+// wykonują się dopiero gdy mmap rpio jest aktywny.
+type NewModbusDeviceOptions struct {
+	PortName        string
+	BaudRate        int
+	TransceiverType string       // "isl43485" | "max485" | "auto"
+	DePin           int          // dla isl43485, max485
+	RePin           int          // tylko dla isl43485
+	DebugLevel      int          // 0..2
+	RetryConfig     *RetryConfig // nil = brak retry
+	SkipPortLock    bool         // testy mogą pominąć lockfile (np. tmpfs)
+}
+
+func validateTransceiverType(t string) error {
+	switch t {
+	case "isl43485", "max485", "auto":
+		return nil
+	default:
+		return fmt.Errorf("unknown transceiver type: %s (expected isl43485|max485|auto)", t)
+	}
+}
+
+func transceiverNeedsRpio(t string) bool {
+	return t == "isl43485" || t == "max485"
+}
+
+func buildTransceiver(t string, dePin, rePin int) (Transceiver, error) {
+	switch t {
+	case "isl43485":
+		return NewGPIOTransceiverISL43485(dePin, rePin), nil
+	case "max485":
+		return NewGPIOTransceiverMAX485(dePin), nil
+	case "auto":
+		return NewAutoTransceiver(), nil
+	default:
+		return nil, fmt.Errorf("unknown transceiver type: %s", t)
+	}
+}
+
+// NewModbusDevice tworzy nowy ModbusDevice z pełną walidacją i defensive
+// cleanup w razie partial init failure.
+//
+// v4.0.0 sygnatura (A6 + opts pattern): wszystko przez NewModbusDeviceOptions.
+// Sygnatura zachowuje też legacy form NewModbusDeviceLegacy dla wstecznego
+// dostępu z binding'u.
+func NewModbusDevice(opts NewModbusDeviceOptions) (*ModbusDevice, error) {
+	if opts.PortName == "" {
+		return nil, fmt.Errorf("port name required")
+	}
+	if opts.BaudRate <= 0 {
+		return nil, fmt.Errorf("baud rate must be > 0, got %d", opts.BaudRate)
+	}
+	if err := validateTransceiverType(opts.TransceiverType); err != nil {
+		return nil, err
+	}
+
+	// F1.3 / A16 — exclusive lock przed openem portu.
+	var lockPath string
+	if !opts.SkipPortLock {
+		var err error
+		lockPath, err = acquirePortLock(opts.PortName)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// F1.4 / A2 — rpio refcount tylko jeśli transceiver wymaga GPIO.
+	needsRpio := transceiverNeedsRpio(opts.TransceiverType)
+	if needsRpio {
+		if err := acquireRpio(); err != nil {
+			releasePortLock(lockPath)
+			return nil, fmt.Errorf("failed to initialize GPIO: %v", err)
+		}
+	}
+
 	mode := &serial.Mode{
-		BaudRate: baudRate,
+		BaudRate: opts.BaudRate,
 		DataBits: 8,
 		Parity:   serial.NoParity,
 		StopBits: serial.OneStopBit,
 	}
-	port, err := serial.Open(portName, mode)
+	port, err := serial.Open(opts.PortName, mode)
 	if err != nil {
+		if needsRpio {
+			releaseRpio()
+		}
+		releasePortLock(lockPath)
 		return nil, fmt.Errorf("failed to open serial port: %v", err)
 	}
-	// M3: jeśli niżej coś się wykraczy, port musi być zamknięty
+
+	// M3 / defensive cleanup
 	success := false
 	defer func() {
 		if !success {
 			_ = port.Close()
+			if needsRpio {
+				releaseRpio()
+			}
+			releasePortLock(lockPath)
 		}
 	}()
 
-	// SetReadTimeout — używamy short timeout (50ms), pętla read sprawdza overall deadline.
-	// bug.st obsługuje natywnie (zamiast trym/serial 5s blocking workaround).
-	if err := port.SetReadTimeout(50 * time.Millisecond); err != nil {
+	if err := port.SetReadTimeout(readSliceTimeout); err != nil {
 		return nil, fmt.Errorf("failed to set read timeout: %v", err)
 	}
 
-	// Initialize GPIO. rpio.Open jest process-global (vide M1 z review).
-	if err := rpio.Open(); err != nil {
-		return nil, fmt.Errorf("failed to initialize GPIO: %v", err)
+	// Transceiver tworzymy TUTAJ — po acquireRpio (Pin().Output() wymaga mmap'a).
+	tx, err := buildTransceiver(opts.TransceiverType, opts.DePin, opts.RePin)
+	if err != nil {
+		return nil, err
 	}
 
-	de := rpio.Pin(dePin)
-	re := rpio.Pin(rePin)
-	de.Output()
-	re.Output()
-	// Set initial state to receive mode (idle, bus zwolniony)
-	de.Low()
-	re.Low()
+	d := &ModbusDevice{
+		port:        port,
+		transceiver: tx,
+		baudRate:    opts.BaudRate,
+		mu:          getPortMutex(opts.PortName),
+		lockFile:    lockPath,
+		debugLevel:  opts.DebugLevel,
+		retryConfig: opts.RetryConfig,
+		stats:       newAtomicStats(),
+		needsRpio:   needsRpio,
+	}
 
-	success = true // wszystko OK — defer cleanup NIE zamknie portu
-	return &ModbusDevice{
-		port:  port,
-		dePin: de,
-		rePin: re,
-	}, nil
+	success = true
+	return d, nil
 }
 
-// Close closes the Modbus device
+// Close zwalnia wszystkie zasoby. Idempotent (M2) — drugie wywołanie = no-op.
+//
+// Lifecycle release order (odwrotny do acquire):
+//   1. transceiver.Close() — bus-idle (driver disabled, receiver enabled).
+//   2. port.Close() — file descriptor zwolniony.
+//   3. releaseRpio() — rpio refcount-- (mmap unmap'owany przy ostatnim).
+//   4. releasePortLock() — lockfile removed.
 func (d *ModbusDevice) Close() {
-	// M2: idempotent — drugie wywołanie no-op (zamiast double-free / panic).
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
 		return
 	}
 	d.closed = true
-	// STABILITY: wymuś stan RX (driver disabled, receiver enabled) przed close.
-	// Bez tego po crash/SIGKILL pin DE pozostawałby HIGH → ISL napędza bus
-	// stale → bus zablokowany dla innych masterów. Kolejność jak w enableRX().
-	d.rePin.Low()
-	d.dePin.Low()
+
+	if d.transceiver != nil {
+		_ = d.transceiver.Close()
+	}
 	if d.port != nil {
-		d.port.Close()
+		_ = d.port.Close()
 		d.port = nil
 	}
-	// rpio.Close() celowo NIE wywoływane — proces-global mmap, drugi ModbusDevice
-	// musiałby ponownie Open. Process exit oczyści zasoby.
+	if d.needsRpio {
+		releaseRpio()
+		d.needsRpio = false
+	}
+	releasePortLock(d.lockFile)
+	d.lockFile = ""
 }
 
-// calculateCRC calculates CRC-16 for Modbus RTU
+// SetDebug — F3.3 / A13. Per-instance debug level setter.
+func (d *ModbusDevice) SetDebug(level int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.debugLevel = level
+}
+
+// SetRetryConfig — F2.3 / A11. Włącz/wyłącz retry policy.
+func (d *ModbusDevice) SetRetryConfig(cfg *RetryConfig) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.retryConfig = cfg
+}
+
+// Stats — F3.4 / A10. Snapshot counters.
+func (d *ModbusDevice) Stats() Stats {
+	return d.stats.snapshot()
+}
+
+// ---------- CRC ----------
+
 func calculateCRC(data []byte) uint16 {
 	crc := uint16(0xFFFF)
 	for _, b := range data {
@@ -158,92 +326,104 @@ func calculateCRC(data []byte) uint16 {
 	return crc
 }
 
-// enableTX enables RS485 transmit mode.
+// ---------- sendModbusRequest ----------
 //
-// ISL43485IBZ truth table (datasheet Renesas DS, Table 1):
-//   /RE  DE | mode               RO        A/B driven
-//   ────────┼──────────────────────────────────────────
-//    0    0 | receive only       data      no (high-Z)
-//    0    1 | transmit + echo    data      yes (driver active)
-//    1    0 | SHUTDOWN (≥300 ns) high-Z    no
-//    1    1 | transmit only      high-Z    yes
-//
-// STABILITY: kolejność tutaj wybrana tak by NIGDY nie wpaść w (/RE=1, DE=0).
-// Z idle state (DE=0, /RE=0 = RX) → najpierw DE=1 (przejście przez "TX+echo",
-// driver się aktywuje a receiver chwilę słyszy własne TX — n/a bo czytamy
-// dopiero po enableRX). Następnie /RE=1 (TX only, czyste). Receiver echo
-// jest harmless: tarm/serial bufor input jest czyszczony przez tcflushInput
-// na początku sendModbusRequest (C3), a my nie czytamy w trakcie TX.
-func (d *ModbusDevice) enableTX() {
-	d.dePin.High() // (0,0)→(0,1): TX+RX echo. Driver ON. Bezpieczne, NIE shutdown.
-	time.Sleep(gpioSwitchDelay)
-	d.rePin.High() // (0,1)→(1,1): TX only. Receiver OFF (RO high-Z).
-	time.Sleep(gpioSwitchDelay)
-}
-
-// enableRX enables RS485 receive mode (inversja enableTX).
-// Z TX-only state (/RE=1, DE=1) → najpierw /RE=0 (przejście przez TX+RX echo,
-// receiver się aktywuje a driver jeszcze nadaje — n/a bo TX już zakończona),
-// potem DE=0 (RX only, bus zwolniony). Także nigdy nie wpadamy w shutdown.
-func (d *ModbusDevice) enableRX() {
-	d.rePin.Low() // (1,1)→(0,1): TX+RX echo. Receiver ON, driver jeszcze ON.
-	time.Sleep(gpioSwitchDelay)
-	d.dePin.Low() // (0,1)→(0,0): RX only. Driver OFF, bus zwolniony.
-	time.Sleep(gpioSwitchDelay)
-}
-
-// sendModbusRequest sends a Modbus request and waits for response.
-//
-// v4.0.0: blokowy write + native Drain() zamiast byte-by-byte + sleep workarounds.
-// C1 (thread-safe): mutex chroni cały cykl TX→RX.
-// C3 (state recovery): port.ResetInputBuffer() przed TX czyści śmieci po previous op.
-// M9: deadline-based read loop (port.SetReadTimeout 50ms granularity + overall 300ms).
+// Core bus operation. Chroniony bus mutex'em (per-port registry — F2.1).
+// Wszystkie błędy I/O liczone do stats.
 func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]byte, error) {
+	// F2.3 / A11 — retry wrap
+	cfg := d.retryConfig
+	maxAttempts := 1
+	backoff := time.Duration(0)
+	if cfg != nil && cfg.MaxRetries > 0 {
+		maxAttempts = 1 + cfg.MaxRetries
+		backoff = cfg.Backoff
+	}
+
+	slaveID := byte(0)
+	if len(request) > 0 {
+		slaveID = request[0]
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			d.dbg("retry %d/%d after error: %v (backoff %v)",
+				attempt, maxAttempts-1, lastErr, backoff)
+			time.Sleep(backoff)
+		}
+		start := time.Now()
+		resp, err := d.sendOnce(request, expectedLength)
+		elapsed := time.Since(start)
+		d.stats.record(slaveID, err, elapsed)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		// Retry tylko transient. ModbusException = permanent.
+		if !isTransientError(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func (d *ModbusDevice) sendOnce(request []byte, expectedLength int) ([]byte, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if d.closed {
+	if d.closed || d.port == nil {
 		return nil, fmt.Errorf("modbus device is closed")
 	}
 
-	// N3: defensive copy — frame buffer w pełni kontrolujemy.
+	// N3 — defensive copy + CRC append
 	bodyLen := len(request)
 	frame := make([]byte, bodyLen+2)
 	copy(frame, request)
 	crc := calculateCRC(request)
 	frame[bodyLen] = byte(crc & 0xFF)
 	frame[bodyLen+1] = byte(crc >> 8)
-	request = frame
-	dbgHex("TX", request)
+	d.dbgHex("TX", frame)
 
-	// C3: drop stale bytes from previous (possibly partial) operation — native API z bug.st.
+	expectedSlaveID := request[0]
+	expectedFC := request[1]
+
+	// F2.2 / A7: bus settle + reset stale bytes (tail-end poprzedniej operacji).
+	// ifg() = 3.5 char @ baud — daje czas żeby ostatni byte wszedł do bufora.
 	if err := d.port.ResetInputBuffer(); err != nil {
 		return nil, fmt.Errorf("failed to reset input buffer: %v", err)
 	}
+	time.Sleep(d.ifg())
+	// Second reset — wszystko co przybyło w trakcie settle.
+	if err := d.port.ResetInputBuffer(); err != nil {
+		return nil, fmt.Errorf("failed to reset input buffer (2nd pass): %v", err)
+	}
 
-	// Enable TX, then write frame as single block (PL011 FIFO mieści całą ramkę).
-	d.enableTX()
-	time.Sleep(preSendDelay)
-	n, err := d.port.Write(request)
+	// Enable TX, write frame, drain to HW FIFO empty, switch to RX.
+	if err := d.transceiver.EnableTX(); err != nil {
+		return nil, fmt.Errorf("transceiver enable TX: %v", err)
+	}
+	d.stats.markTx()
+	n, err := d.port.Write(frame)
 	if err != nil {
+		_ = d.transceiver.EnableRX()
 		return nil, fmt.Errorf("write: %v", err)
 	}
-	if n != len(request) {
-		return nil, fmt.Errorf("short write: %d of %d", n, len(request))
+	if n != len(frame) {
+		_ = d.transceiver.EnableRX()
+		return nil, fmt.Errorf("short write: %d of %d", n, len(frame))
 	}
-	// Q2 SOLVED: port.Drain() — blokujący wait na fizyczne opróżnienie HW UART TX FIFO.
-	// Eliminuje stary "blind" postSendDelay 3ms guess. Gwarantowane: po return,
-	// ostatni bajt już wyszedł na drut → bezpiecznie zwolnić DE.
 	if err := d.port.Drain(); err != nil {
+		_ = d.transceiver.EnableRX()
 		return nil, fmt.Errorf("drain: %v", err)
 	}
-	d.enableRX()
-	time.Sleep(preReceiveDelay)
+	if err := d.transceiver.EnableRX(); err != nil {
+		return nil, fmt.Errorf("transceiver enable RX: %v", err)
+	}
+	// F1.2 + spec — slave używa IFG do detekcji frame boundary; dajemy chwilę.
+	time.Sleep(d.ifg())
 
-	// Read response.
-	// C2: Modbus exception ramka jest KRÓTSZA (5 bajtów: slave, FC|0x80, exceptionCode, CRC, CRC)
-	// niż normalna odpowiedź. Czytamy najpierw min(5, expectedLength) bajtów, peek FC,
-	// jeśli MSB ustawiony — to exception, dalej czytamy do 5 bajtów total. Inaczej do expectedLength.
+	// Read response z deadline'em i F2.2 slaveID skip-until-match.
 	exceptionLen := 5
 	maxLen := expectedLength
 	if exceptionLen > maxLen {
@@ -253,92 +433,124 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 	totalRead := 0
 	deadline := time.Now().Add(requestTimeout)
 
+	// F2.2: skip-until-slaveID. Czytamy do bufora pomocniczego dopóki nie
+	// trafimy na byte == expectedSlaveID. Stray bytes (od poprzedniego slave'a
+	// który łamie spec i odpowiedział po deadline'ie) są dropped + logged.
+	tmpBuf := make([]byte, 1)
+	for totalRead == 0 && time.Now().Before(deadline) {
+		nRead, err := d.port.Read(tmpBuf)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response: %v", err)
+		}
+		if nRead == 0 {
+			continue
+		}
+		if tmpBuf[0] == expectedSlaveID {
+			response[0] = tmpBuf[0]
+			totalRead = 1
+			d.stats.markRx()
+			break
+		}
+		d.dbg("dropped stray byte 0x%02X (expected slave 0x%02X)", tmpBuf[0], expectedSlaveID)
+	}
+	if totalRead == 0 {
+		return nil, fmt.Errorf("modbus timeout: no response from slave 0x%02X within %v",
+			expectedSlaveID, requestTimeout)
+	}
+
 	// Phase 1: czytaj do min(exceptionLen, expectedLength) — wystarczy do detekcji exception.
-	// port.Read blokuje max 50ms (SetReadTimeout), więc pętla sprawdza overall deadline często.
 	phaseTarget := exceptionLen
 	if expectedLength < phaseTarget {
 		phaseTarget = expectedLength
 	}
 	for totalRead < phaseTarget && time.Now().Before(deadline) {
-		n, err := d.port.Read(response[totalRead:])
+		nRead, err := d.port.Read(response[totalRead:phaseTarget])
 		if err != nil {
 			return nil, fmt.Errorf("failed to read response: %v", err)
 		}
-		if n > 0 {
-			totalRead += n
+		if nRead > 0 {
+			totalRead += nRead
 		}
 	}
 
-	// Detekcja exception: FC|0x80 (bit 7 set)
+	// Exception detection: FC|0x80 (MSB set)
 	isException := totalRead >= 2 && (response[1]&0x80) != 0
 	finalLen := expectedLength
 	if isException {
 		finalLen = exceptionLen
 	}
 
-	// Phase 2: dokończ czytanie do finalLen z tym samym deadlinem
+	// Phase 2: dokończ do finalLen
 	for totalRead < finalLen && time.Now().Before(deadline) {
-		n, err := d.port.Read(response[totalRead:])
+		nRead, err := d.port.Read(response[totalRead:finalLen])
 		if err != nil {
 			return nil, fmt.Errorf("failed to read response: %v", err)
 		}
-		if n > 0 {
-			totalRead += n
+		if nRead > 0 {
+			totalRead += nRead
 		}
 	}
 
 	if totalRead < finalLen {
-		dbg("RX timeout: got %d/%d bytes within %v", totalRead, finalLen, requestTimeout)
-		return nil, fmt.Errorf("modbus timeout: got %d/%d bytes within %v", totalRead, finalLen, requestTimeout)
+		d.dbg("RX timeout: got %d/%d bytes within %v", totalRead, finalLen, requestTimeout)
+		return nil, fmt.Errorf("modbus timeout: got %d/%d bytes within %v",
+			totalRead, finalLen, requestTimeout)
 	}
-	dbgHex("RX", response[:finalLen])
+	d.dbgHex("RX", response[:finalLen])
 
-	// Verify slave ID
-	if response[0] != request[0] {
-		return nil, fmt.Errorf("invalid slave ID in response: got %d, expected %d", response[0], request[0])
-	}
-
-	// Verify CRC (przed function code check — gdyby CRC był zły, FC mismatch nieistotny)
+	// Verify CRC (przed FC check)
 	receivedCRC := binary.LittleEndian.Uint16(response[finalLen-2:])
 	calculatedCRC := calculateCRC(response[:finalLen-2])
 	if receivedCRC != calculatedCRC {
 		return nil, fmt.Errorf("CRC error: received %04X, calculated %04X", receivedCRC, calculatedCRC)
 	}
 
-	// C2: jeśli exception, zwróć typed error z exceptionCode zamiast generic FC mismatch
+	// C2 — typed ModbusException
 	if isException {
 		return nil, &ModbusException{
 			SlaveID:       response[0],
-			FunctionCode:  request[1],
+			FunctionCode:  expectedFC,
 			ExceptionCode: response[2],
 		}
 	}
 
-	// Verify function code (normalna odpowiedź — FC musi się zgadzać)
-	if response[1] != request[1] {
-		return nil, fmt.Errorf("invalid function code in response: got %d, expected %d", response[1], request[1])
+	if response[1] != expectedFC {
+		return nil, fmt.Errorf("invalid function code in response: got 0x%02X, expected 0x%02X",
+			response[1], expectedFC)
 	}
 
 	return response[:finalLen], nil
 }
 
-// ReadCoils reads coils from a Modbus slave
-func (d *ModbusDevice) ReadCoils(slaveID byte, startAddr uint16, count uint16) ([]bool, error) {
-	request := []byte{
-		slaveID,
-		0x01,
-		byte(startAddr >> 8),
-		byte(startAddr & 0xFF),
-		byte(count >> 8),
-		byte(count & 0xFF),
-	}
+// ---------- ReadCoils / ReadDiscreteInputs / ReadHoldingRegisters / ReadInputRegisters ----------
 
-	expectedLength := 5 + (count+7)/8
-	response, err := d.sendModbusRequest(request, int(expectedLength))
+func (d *ModbusDevice) ReadCoils(slaveID byte, startAddr, count uint16) ([]bool, error) {
+	request := []byte{
+		slaveID, FCReadCoils,
+		byte(startAddr >> 8), byte(startAddr & 0xFF),
+		byte(count >> 8), byte(count & 0xFF),
+	}
+	response, err := d.sendModbusRequest(request, expectedResponseLength(FCReadCoils, count))
 	if err != nil {
 		return nil, err
 	}
+	return unpackBits(response, count), nil
+}
 
+func (d *ModbusDevice) ReadDiscreteInputs(slaveID byte, startAddr, count uint16) ([]bool, error) {
+	request := []byte{
+		slaveID, FCReadDiscreteInputs,
+		byte(startAddr >> 8), byte(startAddr & 0xFF),
+		byte(count >> 8), byte(count & 0xFF),
+	}
+	response, err := d.sendModbusRequest(request, expectedResponseLength(FCReadDiscreteInputs, count))
+	if err != nil {
+		return nil, err
+	}
+	return unpackBits(response, count), nil
+}
+
+func unpackBits(response []byte, count uint16) []bool {
 	byteCount := response[2]
 	result := make([]bool, count)
 	for i := uint16(0); i < count; i++ {
@@ -348,57 +560,36 @@ func (d *ModbusDevice) ReadCoils(slaveID byte, startAddr uint16, count uint16) (
 			result[i] = (response[3+byteIndex] & (1 << bitIndex)) != 0
 		}
 	}
-
-	return result, nil
+	return result
 }
 
-// ReadDiscreteInputs reads discrete inputs from a Modbus slave
-func (d *ModbusDevice) ReadDiscreteInputs(slaveID byte, startAddr uint16, count uint16) ([]bool, error) {
+func (d *ModbusDevice) ReadHoldingRegisters(slaveID byte, startAddr, count uint16) ([]uint16, error) {
 	request := []byte{
-		slaveID,
-		0x02,
-		byte(startAddr >> 8),
-		byte(startAddr & 0xFF),
-		byte(count >> 8),
-		byte(count & 0xFF),
+		slaveID, FCReadHoldingRegisters,
+		byte(startAddr >> 8), byte(startAddr & 0xFF),
+		byte(count >> 8), byte(count & 0xFF),
 	}
-
-	expectedLength := 5 + (count+7)/8
-	response, err := d.sendModbusRequest(request, int(expectedLength))
+	response, err := d.sendModbusRequest(request, expectedResponseLength(FCReadHoldingRegisters, count))
 	if err != nil {
 		return nil, err
 	}
-
-	byteCount := response[2]
-	result := make([]bool, count)
-	for i := uint16(0); i < count; i++ {
-		byteIndex := i / 8
-		bitIndex := i % 8
-		if byteIndex < uint16(byteCount) {
-			result[i] = (response[3+byteIndex] & (1 << bitIndex)) != 0
-		}
-	}
-
-	return result, nil
+	return unpackRegisters(response, count), nil
 }
 
-// ReadHoldingRegisters reads holding registers from a Modbus slave
-func (d *ModbusDevice) ReadHoldingRegisters(slaveID byte, startAddr uint16, count uint16) ([]uint16, error) {
+func (d *ModbusDevice) ReadInputRegisters(slaveID byte, startAddr, count uint16) ([]uint16, error) {
 	request := []byte{
-		slaveID,
-		0x03,
-		byte(startAddr >> 8),
-		byte(startAddr & 0xFF),
-		byte(count >> 8),
-		byte(count & 0xFF),
+		slaveID, FCReadInputRegisters,
+		byte(startAddr >> 8), byte(startAddr & 0xFF),
+		byte(count >> 8), byte(count & 0xFF),
 	}
-
-	expectedLength := 5 + 2*count
-	response, err := d.sendModbusRequest(request, int(expectedLength))
+	response, err := d.sendModbusRequest(request, expectedResponseLength(FCReadInputRegisters, count))
 	if err != nil {
 		return nil, err
 	}
+	return unpackRegisters(response, count), nil
+}
 
+func unpackRegisters(response []byte, count uint16) []uint16 {
 	byteCount := response[2]
 	result := make([]uint16, count)
 	for i := uint16(0); i < count; i++ {
@@ -406,42 +597,11 @@ func (d *ModbusDevice) ReadHoldingRegisters(slaveID byte, startAddr uint16, coun
 			result[i] = uint16(response[3+2*i])<<8 | uint16(response[4+2*i])
 		}
 	}
-
-	return result, nil
+	return result
 }
 
-// ReadInputRegisters reads input registers from a Modbus slave
-func (d *ModbusDevice) ReadInputRegisters(slaveID byte, startAddr uint16, count uint16) ([]uint16, error) {
-	request := []byte{
-		slaveID,
-		0x04,
-		byte(startAddr >> 8),
-		byte(startAddr & 0xFF),
-		byte(count >> 8),
-		byte(count & 0xFF),
-	}
+// ---------- Write operations ----------
 
-	expectedLength := 5 + 2*count
-	response, err := d.sendModbusRequest(request, int(expectedLength))
-	if err != nil {
-		return nil, err
-	}
-
-	byteCount := response[2]
-	result := make([]uint16, count)
-	for i := uint16(0); i < count; i++ {
-		if 2*i+1 < uint16(byteCount) {
-			result[i] = uint16(response[3+2*i])<<8 | uint16(response[4+2*i])
-		}
-	}
-
-	return result, nil
-}
-
-// verifyWriteEcho sprawdza echo response dla write operations (FC 05, 06, 0F, 10).
-// Slave Modbus odsyła pierwsze 6 bajtów request'a 1:1 jako potwierdzenie.
-// N4: poprzednio tylko WriteCoil to robił — WriteRegister/WriteMultiple* milczały o
-// niespójności (slave mógł zapisać inną wartość, my byśmy nie wiedzieli).
 func verifyWriteEcho(op string, request, response []byte) error {
 	for i := 0; i < 6; i++ {
 		if response[i] != request[i] {
@@ -452,184 +612,79 @@ func verifyWriteEcho(op string, request, response []byte) error {
 	return nil
 }
 
-// WriteCoil writes a single coil to a Modbus slave
 func (d *ModbusDevice) WriteCoil(slaveID byte, coilAddr uint16, value bool) error {
 	request := []byte{
-		slaveID,
-		0x05,
-		byte(coilAddr >> 8),
-		byte(coilAddr & 0xFF),
-		0x00,
-		0x00,
+		slaveID, FCWriteSingleCoil,
+		byte(coilAddr >> 8), byte(coilAddr & 0xFF),
+		0x00, 0x00,
 	}
 	if value {
 		request[4] = 0xFF
 	}
-
-	response, err := d.sendModbusRequest(request, 8)
+	response, err := d.sendModbusRequest(request, expectedResponseLength(FCWriteSingleCoil, 0))
 	if err != nil {
 		return fmt.Errorf("failed to write coil: %v", err)
 	}
 	return verifyWriteEcho("write_coil", request, response)
 }
 
-// WriteRegister writes a single holding register to a Modbus slave.
-// N4: weryfikuje echo (poprzednio brak — slave mógł zapisać inną wartość bez ostrzeżenia).
-func (d *ModbusDevice) WriteRegister(slaveID byte, regAddr uint16, value uint16) error {
+func (d *ModbusDevice) WriteRegister(slaveID byte, regAddr, value uint16) error {
 	request := []byte{
-		slaveID,
-		0x06,
-		byte(regAddr >> 8),
-		byte(regAddr & 0xFF),
-		byte(value >> 8),
-		byte(value & 0xFF),
+		slaveID, FCWriteSingleRegister,
+		byte(regAddr >> 8), byte(regAddr & 0xFF),
+		byte(value >> 8), byte(value & 0xFF),
 	}
-
-	response, err := d.sendModbusRequest(request, 8)
+	response, err := d.sendModbusRequest(request, expectedResponseLength(FCWriteSingleRegister, 0))
 	if err != nil {
 		return fmt.Errorf("failed to write register: %v", err)
 	}
 	return verifyWriteEcho("write_register", request, response)
 }
 
-// WriteMultipleCoils writes multiple coils to a Modbus slave
 func (d *ModbusDevice) WriteMultipleCoils(slaveID byte, startAddr uint16, values []bool) error {
 	byteCount := (len(values) + 7) / 8
 	request := make([]byte, 7+byteCount)
 	request[0] = slaveID
-	request[1] = 0x0F
+	request[1] = FCWriteMultipleCoils
 	request[2] = byte(startAddr >> 8)
 	request[3] = byte(startAddr & 0xFF)
 	request[4] = byte(len(values) >> 8)
 	request[5] = byte(len(values) & 0xFF)
 	request[6] = byte(byteCount)
-
 	for i, value := range values {
 		if value {
 			request[7+i/8] |= 1 << (i % 8)
 		}
 	}
-
-	// N4: response = [slave, FC, addr_hi, addr_lo, qty_hi, qty_lo, CRC, CRC] = 8 bytes.
-	// Pierwsze 6 bajtów = echo żądania (bez byteCount + data + CRC).
-	response, err := d.sendModbusRequest(request, 8)
+	response, err := d.sendModbusRequest(request, expectedResponseLength(FCWriteMultipleCoils, uint16(len(values))))
 	if err != nil {
 		return fmt.Errorf("failed to write multiple coils: %v", err)
 	}
 	return verifyWriteEcho("write_multiple_coils", request, response)
 }
 
-// WriteMultipleRegisters writes multiple holding registers to a Modbus slave.
-// N4: weryfikuje echo response (poprzednio brak — slave mógł napisać inną liczbę
-// rejestrów / na innym adresie a my byśmy tego nie wiedzieli).
 func (d *ModbusDevice) WriteMultipleRegisters(slaveID byte, startAddr uint16, values []uint16) error {
 	request := make([]byte, 7+2*len(values))
 	request[0] = slaveID
-	request[1] = 0x10
+	request[1] = FCWriteMultipleRegisters
 	request[2] = byte(startAddr >> 8)
 	request[3] = byte(startAddr & 0xFF)
 	request[4] = byte(len(values) >> 8)
 	request[5] = byte(len(values) & 0xFF)
 	request[6] = byte(2 * len(values))
-
 	for i, value := range values {
 		request[7+2*i] = byte(value >> 8)
 		request[8+2*i] = byte(value & 0xFF)
 	}
-
-	response, err := d.sendModbusRequest(request, 8)
+	response, err := d.sendModbusRequest(request, expectedResponseLength(FCWriteMultipleRegisters, uint16(len(values))))
 	if err != nil {
 		return fmt.Errorf("failed to write multiple registers: %v", err)
 	}
 	return verifyWriteEcho("write_multiple_registers", request, response)
 }
 
-func main() {
-	// Parse command line arguments
-	port := flag.String("port", "/dev/ttyUSB0", "Serial port")
-	baudRate := flag.Int("baud", 9600, "Baud rate")
-	dePin := flag.Int("de", 17, "DE pin number")
-	rePin := flag.Int("re", 27, "RE pin number")
-	command := flag.String("cmd", "", "Command to execute")
-	slaveID := flag.Int("slave", 1, "Slave ID")
-	startAddr := flag.Int("addr", 0, "Starting address")
-	count := flag.Int("count", 1, "Count")
-	value := flag.Int("value", 0, "Value to write")
-	flag.Parse()
-
-	// Create Modbus device
-	device, err := NewModbusDevice(*port, *baudRate, *dePin, *rePin)
-	if err != nil {
-		log.Fatalf("Failed to create Modbus device: %v", err)
-	}
-	defer device.Close()
-
-	// Execute command
-	switch *command {
-	case "read_coils":
-		values, err := device.ReadCoils(byte(*slaveID), uint16(*startAddr), uint16(*count))
-		if err != nil {
-			log.Fatalf("Failed to read coils: %v", err)
-		}
-		for i, v := range values {
-			fmt.Printf("Coil[%d] = %v\n", i, v)
-		}
-
-	case "read_discrete":
-		values, err := device.ReadDiscreteInputs(byte(*slaveID), uint16(*startAddr), uint16(*count))
-		if err != nil {
-			log.Fatalf("Failed to read discrete inputs: %v", err)
-		}
-		for i, v := range values {
-			fmt.Printf("Input[%d] = %v\n", i, v)
-		}
-
-	case "read_holdreg":
-		values, err := device.ReadHoldingRegisters(byte(*slaveID), uint16(*startAddr), uint16(*count))
-		if err != nil {
-			log.Fatalf("Failed to read holding registers: %v", err)
-		}
-		for i, v := range values {
-			fmt.Printf("Reg[%d] = %d\n", i, v)
-		}
-
-	case "read_inputreg":
-		values, err := device.ReadInputRegisters(byte(*slaveID), uint16(*startAddr), uint16(*count))
-		if err != nil {
-			log.Fatalf("Failed to read input registers: %v", err)
-		}
-		for i, v := range values {
-			fmt.Printf("Reg[%d] = %d\n", i, v)
-		}
-
-	case "write_coil":
-		err := device.WriteCoil(byte(*slaveID), uint16(*startAddr), *value != 0)
-		if err != nil {
-			log.Fatalf("Failed to write coil: %v", err)
-		}
-
-	case "write_register":
-		err := device.WriteRegister(byte(*slaveID), uint16(*startAddr), uint16(*value))
-		if err != nil {
-			log.Fatalf("Failed to write register: %v", err)
-		}
-
-	default:
-		fmt.Println("Usage:")
-		fmt.Println("  read_coils   - Read coils")
-		fmt.Println("  read_discrete - Read discrete inputs")
-		fmt.Println("  read_holdreg  - Read holding registers")
-		fmt.Println("  read_inputreg - Read input registers")
-		fmt.Println("  write_coil    - Write single coil")
-		fmt.Println("  write_register - Write single register")
-		fmt.Println("\nRequired flags:")
-		fmt.Println("  -port <port>     - Serial port (default: /dev/ttyUSB0)")
-		fmt.Println("  -baud <rate>     - Baud rate (default: 9600)")
-		fmt.Println("  -de <pin>        - DE pin number (default: 17)")
-		fmt.Println("  -re <pin>        - RE pin number (default: 27)")
-		fmt.Println("  -slave <id>      - Slave ID (default: 1)")
-		fmt.Println("  -addr <addr>     - Starting address (default: 0)")
-		fmt.Println("  -count <count>   - Count (default: 1)")
-		fmt.Println("  -value <value>   - Value to write (default: 0)")
-	}
-}
+// ---------- main() — pusty stub bo shared lib (F5.3 / A17) ----------
+//
+// Buildmode c-shared wymaga package main z func main(). CLI został
+// przeniesiony do cmd/modbus-cli/main.go jako osobny pakiet.
+func main() {}

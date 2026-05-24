@@ -88,15 +88,18 @@ so: check-raspberry check-go deps
 	@echo "Building as shared library..."
 	cd go && $(CGO_FLAGS) $(GOBUILD) -buildmode=c-shared -o ../lib$(PROJECT_NAME).so $(LDFLAGS)
 
-# Build as binary executable
+# Build as binary executable (CLI)
+# v4.0.0: CLI przeniesione do go/cmd/modbus-cli (F5.3 / A17) — shared lib
+# (go/main.go) nie zawiera już CLI kodu, tylko pusty main() stub wymagany
+# przez buildmode=c-shared.
 binary: check-raspberry check-go deps
-	@echo "Building as binary executable..."
-	cd go && $(CGO_FLAGS) $(GOBUILD) -o ../$(PROJECT_NAME) $(LDFLAGS)
+	@echo "Building CLI binary executable..."
+	cd go/cmd/modbus-cli && $(GO) build -o ../../../$(PROJECT_NAME) $(LDFLAGS)
 
-# Build for Raspberry Pi
+# Build for Raspberry Pi (cross-compile CLI)
 raspberry: check-raspberry check-go deps
-	@echo "Building for Raspberry Pi..."
-	cd go && GOOS=linux GOARCH=arm64 $(GOBUILD) -o ../$(PROJECT_NAME)_raspberry $(LDFLAGS)
+	@echo "Building CLI for Raspberry Pi..."
+	cd go/cmd/modbus-cli && GOOS=linux GOARCH=arm64 $(GOBUILD) -o ../../../$(PROJECT_NAME)_raspberry $(LDFLAGS)
 
 # Clean build files
 clean:

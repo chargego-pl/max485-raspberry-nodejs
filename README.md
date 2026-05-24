@@ -1,6 +1,12 @@
 # max485-raspberry-nodejs
 
-Node.js library for Modbus RTU communication over RS485 using MAX485 transceivers on Raspberry Pi.
+Node.js library for Modbus RTU communication over RS485 on Raspberry Pi.
+
+**v4.0.0** — kompletny architectural refactor. Wszystkie operacje są
+prawdziwie asynchroniczne (napi_async_work, off main thread), z natywnymi
+JS Errors zamiast string sentinels, structured ModbusException, typed arrays,
+opcjonalnym retry, observability counters i finalize_cb chroniącym przed
+resource leak przy GC bez explicit `close()`.
 
 ## Installation
 
@@ -8,108 +14,152 @@ Node.js library for Modbus RTU communication over RS485 using MAX485 transceiver
 npm install max485-raspberry-nodejs
 ```
 
-## Requirements
+Wymaga Linux + Go 1.23+ + `make` + `node-gyp` toolchain (`gcc`, `g++`,
+`libnode-dev`). Auto-build odpalany przez `npm install`.
 
-- Node.js >= 14.0.0
-- Linux (tested on Raspberry Pi)
-- RS-485 Serial Port
-
-## Usage Example
+## Quick start
 
 ```javascript
 const ModbusRTU = require('max485-raspberry-nodejs');
 
-// Create Modbus device instance
-// Parameters:
-// - port: serial port path (e.g., '/dev/serial0' or '/dev/ttyUSB0')
-// - baudRate: communication speed (e.g., 9600)
-// - dePin: GPIO pin number for DE (Driver Enable)
-// - rePin: GPIO pin number for RE (Receiver Enable)
-const device = new ModbusRTU('/dev/serial0', 9600, 17, 27);
+async function main() {
+    const device = await ModbusRTU.open({
+        port:        '/dev/serial0',
+        baudRate:    9600,
+        transceiver: 'isl43485',  // 'isl43485' | 'max485' | 'auto'
+        dePin:       17,           // BCM numbering
+        rePin:       27,           // tylko dla isl43485
+    });
 
-async function example() {
+    // Opcjonalne: włącz automatyczny retry dla transient errors (timeout/CRC).
+    // ModbusException (illegal address etc.) NIE jest retry'owany.
+    device.setRetryConfig({ maxRetries: 2, backoffMs: 50 });
+
     try {
-        // Read coils (function 0x01)
-        const coils = await device.readCoils(1, 0, 4);
-        console.log('Coils state:', coils);
+        const coils = await device.readCoils(21, 0, 4);
+        // -> [true, false, true, false]  (natywny Array<boolean>)
 
-        // Write single coil (function 0x05)
-        await device.writeCoil(1, 0, true);
+        await device.writeCoil(21, 0, true);
+        await device.writeMultipleCoils(21, 0, [true, false, true, false]);
 
-        // Write multiple coils (function 0x0F)
-        await device.writeMultipleCoils(1, 0, [true, false, true, false]);
+        const regs = await device.readHoldingRegisters(21, 0, 4);
+        // -> [42, 100, 0, 65535]         (natywny Array<number>)
 
-        // Read holding registers (function 0x03)
-        const registers = await device.readHoldingRegisters(1, 0, 4);
-        console.log('Registers state:', registers);
+        await device.writeRegister(21, 0, 123);
+        await device.writeMultipleRegisters(21, 0, [50, 100, 150, 200]);
 
-        // Write single register (function 0x06)
-        await device.writeRegister(1, 0, 123);
-
-        // Write multiple registers (function 0x10)
-        await device.writeMultipleRegisters(1, 0, [50, 100, 150, 200]);
-
-    } catch (error) {
-        console.error('Error:', error.message);
+    } catch (e) {
+        if (e.code === 'MODBUS_EXCEPTION') {
+            // Structured fields — bez parse'owania message string!
+            console.error('Modbus exception:', {
+                slaveID:       e.slaveID,        // np. 21
+                functionCode:  e.functionCode,   // np. 0x05
+                exceptionCode: e.exceptionCode,  // np. 0x02 = illegal data address
+            });
+        } else {
+            console.error('Bus error:', e.message);
+        }
     } finally {
-        // Close connection
-        device.close();
+        await device.close();
     }
 }
 
-example();
+main();
 ```
+
+## Transceiver types
+
+| Type | Description | Pins |
+|------|-------------|------|
+| `isl43485` | ISL43485IBZ (HAT Power Shield v2). Driver enable order chroni przed SHUTDOWN trap. | `dePin`, `rePin` |
+| `max485` | Klasyczny MAX485 (DE i /RE złączone w 1 pin). | `dePin` only |
+| `auto` | USB↔RS485 z auto-direction (CH340, FTDI w RS485 mode). | — |
 
 ## API
 
-### Constructor
+### `static async ModbusRTU.open(opts) → Promise<ModbusRTU>`
 
-#### `new ModbusRTU(port, baudRate, dePin, rePin)`
+Async factory — **JEDYNY** supported sposób tworzenia instancji w v4.x.
+`new ModbusRTU(...)` rzuca.
 
-- `port` (string): Serial port path
-- `baudRate` (number): Communication speed
-- `dePin` (number): GPIO pin number for DE signal
-- `rePin` (number): GPIO pin number for RE signal
+Opts: `{ port, baudRate, transceiver='isl43485', dePin=17, rePin=27 }`.
 
-### Methods
+### Read ops (Promise → natywny Array)
 
-#### Reading Data
+- `readCoils(slaveID, startAddr, count) → Promise<boolean[]>`
+- `readDiscreteInputs(slaveID, startAddr, count) → Promise<boolean[]>`
+- `readHoldingRegisters(slaveID, startAddr, count) → Promise<number[]>`
+- `readInputRegisters(slaveID, startAddr, count) → Promise<number[]>`
 
-- `readCoils(slaveId, startAddr, count)`: Read coils (function 0x01)
-- `readDiscreteInputs(slaveId, startAddr, count)`: Read discrete inputs (function 0x02)
-- `readHoldingRegisters(slaveId, startAddr, count)`: Read holding registers (function 0x03)
-- `readInputRegisters(slaveId, startAddr, count)`: Read input registers (function 0x04)
+### Write ops (Promise<void>)
 
-Parameters:
-- `slaveId` (number): Modbus device address (1-247)
-- `startAddr` (number): Starting address
-- `count` (number): Number of elements to read
+- `writeCoil(slaveID, coilAddr, value: boolean)`
+- `writeRegister(slaveID, regAddr, value: number)`
+- `writeMultipleCoils(slaveID, startAddr, values: boolean[])`
+- `writeMultipleRegisters(slaveID, startAddr, values: number[])`
 
-Returns: Promise with array of values (boolean for coils/inputs, number for registers)
+### Configuration
 
-#### Writing Data
+- `setDebug(level: 0|1|2)` — per-instance debug. `0`=off, `1`=basic events,
+  `2`=basic + hex TX/RX dump. Wcześniej globalny env var `MAX485_DEBUG`;
+  teraz consumer sam wybiera per device:
+  ```js
+  if (process.env.MAX485_DEBUG) device.setDebug(parseInt(process.env.MAX485_DEBUG, 10) || 1);
+  ```
+- `setRetryConfig({ maxRetries, backoffMs })` — włącz retry dla transient.
+  `setRetryConfig(null)` lub `{ maxRetries: 0 }` wyłącza.
 
-- `writeCoil(slaveId, addr, value)`: Write single coil (function 0x05)
-- `writeRegister(slaveId, addr, value)`: Write single register (function 0x06)
-- `writeMultipleCoils(slaveId, startAddr, values)`: Write multiple coils (function 0x0F)
-- `writeMultipleRegisters(slaveId, startAddr, values)`: Write multiple registers (function 0x10)
+### Observability
 
-Parameters:
-- `slaveId` (number): Modbus device address (1-247)
-- `addr`/`startAddr` (number): Address to write to
-- `value` (boolean/number): Value to write
-- `values` (Array): Array of values to write
+- `stats() → object` (sync, czysty snapshot atomic counters)
 
-Returns: Promise
+```js
+{
+  opsTotal: 12345n,                            // BigInt
+  opsByResult: {
+    success: 12000n, timeout: 12n, crc_error: 3n,
+    exception: 5n, io_error: 0n
+  },
+  opsBySlave: {
+    '21': { ops: 5000n, successes: 4990n, timeouts: 5n, ..., sumLatencyMicro: 12340567n },
+    '31': { ... }
+  },
+  lastTxUnixNano: 1748100000000000000n,
+  lastRxUnixNano: 1748100000003200000n,
+}
+```
 
-#### Connection Management
+### Lifecycle
 
-- `close()`: Closes the connection to the device
+- `async close()` — zwalnia port, GPIO bus-idle, lockfile removed, rpio
+  refcount decremented. Idempotent. Jeśli pominiesz, napi finalize_cb przy
+  GC i tak posprząta (F1.1 / A4) — ale explicit close = deterministic timing.
 
-## Error Handling
+## Error model
 
-All methods (except `close()`) return a Promise. In case of an error, the Promise is rejected with an appropriate error message.
+Wszystkie operacje bus mogą rzucić:
+
+| Error.code | Pola | Kiedy |
+|------------|------|-------|
+| `MODBUS_EXCEPTION` | `slaveID`, `functionCode`, `exceptionCode` | Slave zwrócił FC \| 0x80 (permanent) |
+| _undefined_ | `message` zawiera "modbus timeout", "CRC error", "write:", "drain:" etc. | Transient bus error (retry-able) |
+
+`MODBUS_EXCEPTION` NIE jest retry'owany przez `setRetryConfig` (permanent
+application error). Wszystko inne (timeout, CRC, IO) traktujemy jako
+transient → retry kicks in jeśli skonfigurowane.
+
+## v3.x → v4.0.0 migration
+
+| v3.x | v4.0.0 |
+|------|--------|
+| `new ModbusRTU(port, baud, de, re)` | `await ModbusRTU.open({ port, baudRate, transceiver: 'isl43485', dePin, rePin })` |
+| `device.close()` (sync) | `await device.close()` |
+| `result.startsWith('Error:')` then throw | `try/catch` (natywny throw) |
+| `error.message.includes('exception')` (parse) | `error.code === 'MODBUS_EXCEPTION'`, fields `slaveID`/`functionCode`/`exceptionCode` |
+| `JSON.parse(await readCoils(...))` | `await readCoils(...)` (natywny array) |
+| `await writeCoil(...) === 'success'` | `await writeCoil(...)` (Promise<void>) |
+| `MAX485_DEBUG=1` env var | `device.setDebug(1)` |
 
 ## License
 
-MIT 
+MIT

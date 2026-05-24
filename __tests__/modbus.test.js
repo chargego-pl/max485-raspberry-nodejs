@@ -1,57 +1,117 @@
-const { mockDeep } = require('jest-mock-extended');
-const ffi = require('ffi-napi');
+// v4.0.0 — stary test używał ffi-napi (legacy implementation z prebuilt .so).
+// Teraz mamy node-gyp + napi addon + factory pattern. Test mockujemy native
+// module — sprawdzamy że index.js (high-level wrapper) prawidłowo wywołuje
+// natywne funkcje.
 
-jest.mock('ffi-napi');
+jest.mock('../build/Release/modbus', () => ({
+    NewModbusDevice: jest.fn(),
+    ReadCoils: jest.fn(),
+    ReadDiscreteInputs: jest.fn(),
+    ReadHoldingRegisters: jest.fn(),
+    ReadInputRegisters: jest.fn(),
+    WriteCoil: jest.fn(),
+    WriteRegister: jest.fn(),
+    WriteMultipleCoils: jest.fn(),
+    WriteMultipleRegisters: jest.fn(),
+    Close: jest.fn(),
+    SetDebug: jest.fn(),
+    SetRetryConfig: jest.fn(),
+    Stats: jest.fn(),
+}), { virtual: true });
 
-const ModbusLibraryMock = mockDeep();
-ffi.Library.mockReturnValue(ModbusLibraryMock);
+const native = require('../build/Release/modbus');
+const ModbusRTU = require('../index.js');
 
-const Modbus = require('../index');
+const fakeHandle = { __external: true };
 
-describe('Max485RaspberryNodejs', () => {
-    let modbus;
-
+describe('ModbusRTU v4.0.0 wrapper', () => {
     beforeEach(() => {
-        modbus = new Modbus({
-            port: '/dev/ttyAMA0',
-            baudrate: 9600,
-            de_pin: 17,
-            re_pin: 27
+        jest.clearAllMocks();
+        native.NewModbusDevice.mockResolvedValue(fakeHandle);
+        native.Close.mockResolvedValue(undefined);
+    });
+
+    test('open() wywołuje native z poprawnymi argumentami i zwraca instance', async () => {
+        const device = await ModbusRTU.open({
+            port: '/dev/serial0', baudRate: 9600,
+            transceiver: 'isl43485', dePin: 17, rePin: 27,
         });
-
-        ModbusLibraryMock.modbus_rtu_read_c.mockClear();
-        ModbusLibraryMock.modbus_rtu_write_c.mockClear();
+        expect(native.NewModbusDevice).toHaveBeenCalledWith('/dev/serial0', 9600, 'isl43485', 17, 27);
+        expect(device).toBeInstanceOf(ModbusRTU);
     });
 
-    test('should successfully read a register', async () => {
-        ModbusLibraryMock.modbus_rtu_read_c.mockReturnValue(123);
-
-        const result = await modbus.read(1, 2);
-
-        expect(ModbusLibraryMock.modbus_rtu_read_c).toHaveBeenCalledWith('/dev/ttyAMA0', 9600, 17, 27, 1, 2);
-        expect(result).toBe(123);
+    test('open() defaults: transceiver=isl43485, dePin=17, rePin=27', async () => {
+        await ModbusRTU.open({ port: '/dev/serial0', baudRate: 9600 });
+        expect(native.NewModbusDevice).toHaveBeenCalledWith('/dev/serial0', 9600, 'isl43485', 17, 27);
     });
 
-    test('should fail reading a register with error', async () => {
-        ModbusLibraryMock.modbus_rtu_read_c.mockReturnValue(-1);
-
-        await expect(modbus.read(1, 2)).rejects.toThrow('Modbus read failed with error code: -1');
-        expect(ModbusLibraryMock.modbus_rtu_read_c).toHaveBeenCalledWith('/dev/ttyAMA0', 9600, 17, 27, 1, 2);
+    test('open() rzuca przy złym transceiver type', async () => {
+        await expect(ModbusRTU.open({
+            port: '/dev/serial0', baudRate: 9600, transceiver: 'bogus'
+        })).rejects.toThrow(/transceiver/);
     });
 
-    test('should successfully write to a register', async () => {
-        ModbusLibraryMock.modbus_rtu_write_c.mockReturnValue(0);
-
-        await expect(modbus.write(1, 2, 42)).resolves.not.toThrow();
-
-        expect(ModbusLibraryMock.modbus_rtu_write_c).toHaveBeenCalledWith('/dev/ttyAMA0', 9600, 17, 27, 1, 2, 42);
+    test('bezpośredni `new ModbusRTU(null)` rzuca z hint o factory', () => {
+        expect(() => new ModbusRTU(null)).toThrow(/ModbusRTU\.open/);
     });
 
-    test('should fail writing to a register with error', async () => {
-        ModbusLibraryMock.modbus_rtu_write_c.mockReturnValue(-1);
+    test('readCoils() forwarduje args do native', async () => {
+        const device = await ModbusRTU.open({ port: '/dev/serial0', baudRate: 9600 });
+        native.ReadCoils.mockResolvedValue([true, false, true]);
+        const out = await device.readCoils(21, 0, 3);
+        expect(native.ReadCoils).toHaveBeenCalledWith(fakeHandle, 21, 0, 3);
+        expect(out).toEqual([true, false, true]);
+    });
 
-        await expect(modbus.write(1, 2, 42)).rejects.toThrow('Modbus write failed with error code: -1');
+    test('writeCoil() forwarduje i normalizuje boolean', async () => {
+        const device = await ModbusRTU.open({ port: '/dev/serial0', baudRate: 9600 });
+        native.WriteCoil.mockResolvedValue(undefined);
+        await device.writeCoil(21, 0, 1); // truthy → true
+        expect(native.WriteCoil).toHaveBeenCalledWith(fakeHandle, 21, 0, true);
+    });
 
-        expect(ModbusLibraryMock.modbus_rtu_write_c).toHaveBeenCalledWith('/dev/ttyAMA0', 9600, 17, 27, 1, 2, 42);
+    test('writeMultipleCoils() normalizuje array booleanów', async () => {
+        const device = await ModbusRTU.open({ port: '/dev/serial0', baudRate: 9600 });
+        native.WriteMultipleCoils.mockResolvedValue(undefined);
+        await device.writeMultipleCoils(21, 0, [1, 0, 'yes', '']);
+        expect(native.WriteMultipleCoils).toHaveBeenCalledWith(fakeHandle, 21, 0, [true, false, true, false]);
+    });
+
+    test('setDebug() forwarduje level', async () => {
+        const device = await ModbusRTU.open({ port: '/dev/serial0', baudRate: 9600 });
+        device.setDebug(2);
+        expect(native.SetDebug).toHaveBeenCalledWith(fakeHandle, 2);
+    });
+
+    test('setRetryConfig(null) wyłącza retry', async () => {
+        const device = await ModbusRTU.open({ port: '/dev/serial0', baudRate: 9600 });
+        device.setRetryConfig(null);
+        expect(native.SetRetryConfig).toHaveBeenCalledWith(fakeHandle, 0, 0);
+    });
+
+    test('setRetryConfig({maxRetries, backoffMs}) przekazuje obie wartości', async () => {
+        const device = await ModbusRTU.open({ port: '/dev/serial0', baudRate: 9600 });
+        device.setRetryConfig({ maxRetries: 3, backoffMs: 100 });
+        expect(native.SetRetryConfig).toHaveBeenCalledWith(fakeHandle, 3, 100);
+    });
+
+    test('close() jest idempotent + setuje _closed', async () => {
+        const device = await ModbusRTU.open({ port: '/dev/serial0', baudRate: 9600 });
+        await device.close();
+        await device.close(); // no-op
+        expect(native.Close).toHaveBeenCalledTimes(1);
+    });
+
+    test('po close() metody rzucają', async () => {
+        const device = await ModbusRTU.open({ port: '/dev/serial0', baudRate: 9600 });
+        await device.close();
+        expect(() => device.readCoils(21, 0, 1)).toThrow(/closed/);
+    });
+
+    test('stats() zwraca raw native object', async () => {
+        const device = await ModbusRTU.open({ port: '/dev/serial0', baudRate: 9600 });
+        native.Stats.mockReturnValue({ opsTotal: 42n, opsByResult: {} });
+        const s = device.stats();
+        expect(s.opsTotal).toBe(42n);
     });
 });

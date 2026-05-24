@@ -1,51 +1,69 @@
-const ModbusDevice = require('../index.js');
+// v4.0.0 mocha integration test — wymaga fizycznego urządzenia Modbus
+// na busie (np. wiata RPi z Pico firmware'm).
+//
+// Uruchomienie: `mocha test/test.js` (mocha musi być zainstalowane).
+
+const ModbusRTU = require('../index.js');
 const assert = require('assert');
 
-describe('ModbusDevice', () => {
+describe('ModbusDevice (v4.0.0 integration)', function () {
+    this.timeout(10000);
+
     let device;
 
-    before(() => {
-        // Uwaga: testy wymagają fizycznego urządzenia Modbus
-        // Zmień parametry według swojej konfiguracji
-        device = new ModbusDevice('/dev/serial0', 9600, 17, 27);
+    before(async () => {
+        device = await ModbusRTU.open({
+            port: '/dev/serial0',
+            baudRate: 9600,
+            transceiver: 'isl43485',
+            dePin: 17,
+            rePin: 27,
+        });
     });
 
-    after(() => {
+    after(async () => {
         if (device) {
-            device.close();
+            await device.close();
         }
     });
 
     it('powinno odczytać cewki', async () => {
-        const coils = await device.readCoils(1, 0, 10);
+        const coils = await device.readCoils(21, 0, 10);
         assert(Array.isArray(coils), 'readCoils powinno zwrócić tablicę');
-        assert(coils.length === 10, 'readCoils powinno zwrócić 10 wartości');
+        assert.strictEqual(coils.length, 10);
         coils.forEach(coil => {
-            assert(typeof coil === 'boolean', 'każda cewka powinna być typu boolean');
+            assert.strictEqual(typeof coil, 'boolean');
         });
     });
 
     it('powinno odczytać rejestry', async () => {
-        const registers = await device.readHoldingRegisters(1, 0, 5);
-        assert(Array.isArray(registers), 'readHoldingRegisters powinno zwrócić tablicę');
-        assert(registers.length === 5, 'readHoldingRegisters powinno zwrócić 5 wartości');
+        const registers = await device.readHoldingRegisters(21, 0, 5);
+        assert(Array.isArray(registers));
+        assert.strictEqual(registers.length, 5);
         registers.forEach(register => {
-            assert(typeof register === 'number', 'każdy rejestr powinien być liczbą');
-            assert(register >= 0 && register <= 65535, 'wartość rejestru powinna być w zakresie 0-65535');
+            assert.strictEqual(typeof register, 'number');
+            assert(register >= 0 && register <= 65535);
         });
     });
 
     it('powinno zapisać i odczytać cewkę', async () => {
         const testValue = true;
-        await device.writeCoil(1, 0, testValue);
-        const [coil] = await device.readCoils(1, 0, 1);
-        assert.strictEqual(coil, testValue, 'odczytana wartość powinna być równa zapisanej');
+        await device.writeCoil(21, 0, testValue);
+        const [coil] = await device.readCoils(21, 0, 1);
+        assert.strictEqual(coil, testValue);
     });
 
     it('powinno zapisać i odczytać rejestr', async () => {
         const testValue = 12345;
-        await device.writeRegister(1, 0, testValue);
-        const [register] = await device.readHoldingRegisters(1, 0, 1);
-        assert.strictEqual(register, testValue, 'odczytana wartość powinna być równa zapisanej');
+        await device.writeRegister(21, 0, testValue);
+        const [register] = await device.readHoldingRegisters(21, 0, 1);
+        assert.strictEqual(register, testValue);
     });
-}); 
+
+    it('stats() raportuje wzrost opsTotal po operacjach', async () => {
+        const before = device.stats().opsTotal;
+        await device.readCoils(21, 0, 1);
+        const after = device.stats().opsTotal;
+        assert(after > before, `expected opsTotal > ${before}, got ${after}`);
+    });
+});
