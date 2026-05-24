@@ -451,16 +451,24 @@ func Init(env C.napi_env, exports C.napi_value) C.napi_value {
     var modbusDevice C.napi_value
     C.napi_create_object(env, &modbusDevice)
 
-    C.create_function(env, modbusDevice, C.CString("NewModbusDevice"), (C.napi_callback)(C.NewModbusDeviceJS))
-    C.create_function(env, modbusDevice, C.CString("ReadCoils"), (C.napi_callback)(C.ReadCoilsJS))
-    C.create_function(env, modbusDevice, C.CString("ReadDiscreteInputs"), (C.napi_callback)(C.ReadDiscreteInputsJS))
-    C.create_function(env, modbusDevice, C.CString("ReadHoldingRegisters"), (C.napi_callback)(C.ReadHoldingRegistersJS))
-    C.create_function(env, modbusDevice, C.CString("ReadInputRegisters"), (C.napi_callback)(C.ReadInputRegistersJS))
-    C.create_function(env, modbusDevice, C.CString("WriteCoil"), (C.napi_callback)(C.WriteCoilJS))
-    C.create_function(env, modbusDevice, C.CString("WriteRegister"), (C.napi_callback)(C.WriteRegisterJS))
-    C.create_function(env, modbusDevice, C.CString("WriteMultipleCoils"), (C.napi_callback)(C.WriteMultipleCoilsJS))
-    C.create_function(env, modbusDevice, C.CString("WriteMultipleRegisters"), (C.napi_callback)(C.WriteMultipleRegistersJS))
-    C.create_function(env, modbusDevice, C.CString("Close"), (C.napi_callback)(C.CloseJS))
+    // N6 FIX: helper żeby uniknąć leaków C.CString (poprzednio 10× CString
+    // alokowane bez free — ~150B leak per module init, mały ale niepotrzebny).
+    register := func(name string, cb C.napi_callback) {
+        cs := C.CString(name)
+        defer C.free(unsafe.Pointer(cs))
+        C.create_function(env, modbusDevice, cs, cb)
+    }
+
+    register("NewModbusDevice", (C.napi_callback)(C.NewModbusDeviceJS))
+    register("ReadCoils", (C.napi_callback)(C.ReadCoilsJS))
+    register("ReadDiscreteInputs", (C.napi_callback)(C.ReadDiscreteInputsJS))
+    register("ReadHoldingRegisters", (C.napi_callback)(C.ReadHoldingRegistersJS))
+    register("ReadInputRegisters", (C.napi_callback)(C.ReadInputRegistersJS))
+    register("WriteCoil", (C.napi_callback)(C.WriteCoilJS))
+    register("WriteRegister", (C.napi_callback)(C.WriteRegisterJS))
+    register("WriteMultipleCoils", (C.napi_callback)(C.WriteMultipleCoilsJS))
+    register("WriteMultipleRegisters", (C.napi_callback)(C.WriteMultipleRegistersJS))
+    register("Close", (C.napi_callback)(C.CloseJS))
 
     return modbusDevice
 }

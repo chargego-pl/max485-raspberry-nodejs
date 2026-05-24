@@ -45,11 +45,17 @@ check-sudo:
 		exit 1; \
 	fi
 
-# Default target
-all: check-raspberry check-go deps binary
+# Default target.
+# M11 FIX: poprzednio default `binary` budował standalone CLI executable,
+# co dla typowego użycia jako Node addon było zbędne (i mylące — addon
+# nie buduje się tym targetem, wymaga `npx node-gyp rebuild`).
+# Teraz `make` / `make build` / `make all` buduje shared library (.so)
+# której potrzebuje Node addon (npm install hooks na `make so`).
+# Dla CLI executable: `make binary`.
+all: check-raspberry check-go deps so
 
 # Build target
-build: check-raspberry check-go deps binary
+build: check-raspberry check-go deps so
 
 # Install Go
 install-go: check-raspberry check-sudo
@@ -99,10 +105,27 @@ clean:
 	rm -f $(PROJECT_NAME) $(PROJECT_NAME)_raspberry lib$(PROJECT_NAME).so
 	rm -f go$(GO_VERSION).$(GO_OS)-$(GO_ARCH).tar.gz
 
-# Run tests
+# Run Go unit tests
 test: check-raspberry check-go
-	@echo "Running tests..."
+	@echo "Running Go tests..."
 	cd go && $(GOTEST) -v ./...
+
+# N9: Run JS integration tests (wymagają zbudowanego addon + libmodbus.so).
+# Test pliki w __tests__/ i test/ używają biblioteki przez require('./').
+test-js: check-raspberry
+	@echo "Running JS integration tests..."
+	@if [ ! -f build/Release/modbus.node ]; then \
+		echo "Error: build/Release/modbus.node nie istnieje. Uruchom 'npx node-gyp rebuild' najpierw."; \
+		exit 1; \
+	fi
+	@if [ ! -f libmodbus.so ]; then \
+		echo "Error: libmodbus.so nie istnieje. Uruchom 'make so' najpierw."; \
+		exit 1; \
+	fi
+	node --test __tests__/ test/ 2>&1 || node test.js
+
+# Run all tests (Go + JS)
+test-all: test test-js
 
 # Show help
 help:
@@ -119,4 +142,4 @@ help:
 	@echo "  make test         - Run tests"
 	@echo "  make help         - Show this help"
 
-.PHONY: all build deps so binary raspberry clean test help install-go install-deps check-raspberry check-sudo check-go 
+.PHONY: all build deps so binary raspberry clean test test-js test-all help install-go install-deps check-raspberry check-sudo check-go 

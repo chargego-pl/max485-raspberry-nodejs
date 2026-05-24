@@ -2,15 +2,36 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"syscall"
 	"time"
 
 	"github.com/stianeikeland/go-rpio/v4"
 	"github.com/tarm/serial"
 )
+
+// N5: debug logging behind env var MAX485_DEBUG=1 (lub =hex dla pełnego dump TX/RX).
+// Domyślnie ciche — żeby produkcja nie wypluwała loga na stderr na każdą operację.
+// Touchapp-control może włączyć przez `Environment=MAX485_DEBUG=1` w drop-inie.
+var debugMode = os.Getenv("MAX485_DEBUG")
+
+func dbg(format string, args ...interface{}) {
+	if debugMode == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[max485] "+format+"\n", args...)
+}
+
+func dbgHex(label string, data []byte) {
+	if debugMode != "hex" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[max485] %s: %s\n", label, hex.EncodeToString(data))
+}
 
 // Const TCFLSH ioctl for input buffer flush (Linux). Manually defined żeby uniknąć
 // zależności od golang.org/x/sys/unix (utrzymujemy minimalne deps biblioteki).
@@ -64,7 +85,12 @@ const (
 	ModbusSerialError
 )
 
-// NewModbusDevice creates a new Modbus device
+// NewModbusDevice creates a new Modbus device.
+//
+// M3: defensive cleanup pattern — `success` flag + defer cleanup. Każdy step
+// init może zawieść; jeśli zawiedzie po częściowej alokacji, defer cleanup
+// zamyka co już zostało otwarte (port, rpio.Open). Bez tego partial init
+// leaks resources (port.Close nie wywołane, GPIO mmap leak).
 func NewModbusDevice(portName string, baudRate int, dePin, rePin int) (*ModbusDevice, error) {
 	// Configure serial port.
 	// M9: ReadTimeout = 50ms (zmniejszone z 5s) — pojedynczy port.Read blokuje max 50ms,
@@ -84,19 +110,27 @@ func NewModbusDevice(portName string, baudRate int, dePin, rePin int) (*ModbusDe
 	if err != nil {
 		return nil, fmt.Errorf("failed to open serial port: %v", err)
 	}
+	// M3: jeśli niżej coś się wykraczy, port musi być zamknięty
+	success := false
+	defer func() {
+		if !success {
+			_ = port.Close()
+		}
+	}()
 	portNameForFlush = portName // C3: zapamiętaj do tcflushInput
 
 	// Set additional port parameters
 	if err := port.Flush(); err != nil {
-		port.Close()
 		return nil, fmt.Errorf("failed to flush port: %v", err)
 	}
 
 	// Initialize GPIO
 	if err := rpio.Open(); err != nil {
-		port.Close()
 		return nil, fmt.Errorf("failed to initialize GPIO: %v", err)
 	}
+	// rpio.Close jest process-global (vide M1 z review) — NIE wywołujemy w defer
+	// nawet przy partial init, bo mogłby ubić inny ModbusDevice. Akceptujemy
+	// rzadki small leak rpio mmap (~4KB) jako trade-off.
 
 	de := rpio.Pin(dePin)
 	re := rpio.Pin(rePin)
@@ -104,14 +138,15 @@ func NewModbusDevice(portName string, baudRate int, dePin, rePin int) (*ModbusDe
 	de.Output()
 	re.Output()
 
-	// Set initial state to receive mode
+	// Set initial state to receive mode (idle, bus zwolniony)
 	de.Low()
 	re.Low()
 
+	success = true // wszystko OK — defer cleanup NIE zamknie portu
 	return &ModbusDevice{
-		port:   port,
-		dePin:  de,
-		rePin:  re,
+		port:  port,
+		dePin: de,
+		rePin: re,
 	}, nil
 }
 
@@ -154,25 +189,36 @@ func calculateCRC(data []byte) uint16 {
 }
 
 // enableTX enables RS485 transmit mode.
-// STABILITY: kolejność wybrana tak by NIGDY nie wpaść w stan (/RE=1, DE=0),
-// który wprowadza ISL43485IBZ w shutdown mode (datasheet: ≥300 ns próg,
-// ~3 µs exit time). Przejście przez stan "DE=1, /RE=0" (oba enabled, echo)
-// jest bezpieczne — driver nadaje, receiver słyszy swoje TX (irrelevant).
+//
+// ISL43485IBZ truth table (datasheet Renesas DS, Table 1):
+//   /RE  DE | mode               RO        A/B driven
+//   ────────┼──────────────────────────────────────────
+//    0    0 | receive only       data      no (high-Z)
+//    0    1 | transmit + echo    data      yes (driver active)
+//    1    0 | SHUTDOWN (≥300 ns) high-Z    no
+//    1    1 | transmit only      high-Z    yes
+//
+// STABILITY: kolejność tutaj wybrana tak by NIGDY nie wpaść w (/RE=1, DE=0).
+// Z idle state (DE=0, /RE=0 = RX) → najpierw DE=1 (przejście przez "TX+echo",
+// driver się aktywuje a receiver chwilę słyszy własne TX — n/a bo czytamy
+// dopiero po enableRX). Następnie /RE=1 (TX only, czyste). Receiver echo
+// jest harmless: tarm/serial bufor input jest czyszczony przez tcflushInput
+// na początku sendModbusRequest (C3), a my nie czytamy w trakcie TX.
 func (d *ModbusDevice) enableTX() {
-	d.dePin.High() // DE=1, /RE=0 → TX+RX echo (bezpieczne, NIE shutdown)
+	d.dePin.High() // (0,0)→(0,1): TX+RX echo. Driver ON. Bezpieczne, NIE shutdown.
 	time.Sleep(gpioSwitchDelay)
-	d.rePin.High() // DE=1, /RE=1 → TX only (driver active, receiver off)
+	d.rePin.High() // (0,1)→(1,1): TX only. Receiver OFF (RO high-Z).
 	time.Sleep(gpioSwitchDelay)
 }
 
-// enableRX enables RS485 receive mode.
-// STABILITY: kolejność jak w enableTX — najpierw /RE=0 (re-enable receiver
-// gdy driver jeszcze aktywny), potem DE=0 (driver off). NIGDY nie wpadamy
-// w shutdown (/RE=1, DE=0).
+// enableRX enables RS485 receive mode (inversja enableTX).
+// Z TX-only state (/RE=1, DE=1) → najpierw /RE=0 (przejście przez TX+RX echo,
+// receiver się aktywuje a driver jeszcze nadaje — n/a bo TX już zakończona),
+// potem DE=0 (RX only, bus zwolniony). Także nigdy nie wpadamy w shutdown.
 func (d *ModbusDevice) enableRX() {
-	d.rePin.Low() // DE=1, /RE=0 → TX+RX echo
+	d.rePin.Low() // (1,1)→(0,1): TX+RX echo. Receiver ON, driver jeszcze ON.
 	time.Sleep(gpioSwitchDelay)
-	d.dePin.Low() // DE=0, /RE=0 → RX only
+	d.dePin.Low() // (0,1)→(0,0): RX only. Driver OFF, bus zwolniony.
 	time.Sleep(gpioSwitchDelay)
 }
 
@@ -190,9 +236,17 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 		return nil, fmt.Errorf("modbus device is closed")
 	}
 
-	// Add CRC to request
+	// N3: defensive copy — append może realloc'ować lub aliassować caller's slice.
+	// Wszystkie callerzy w tym pliku (Read*/Write*) tworzą fresh slice więc nie ma
+	// real shadow bug, ALE explicit copy chroni przed potencjalnym reuse w przyszłości.
+	bodyLen := len(request)
+	frame := make([]byte, bodyLen+2)
+	copy(frame, request)
 	crc := calculateCRC(request)
-	request = append(request, byte(crc&0xFF), byte(crc>>8))
+	frame[bodyLen] = byte(crc & 0xFF)
+	frame[bodyLen+1] = byte(crc >> 8)
+	request = frame
+	dbgHex("TX", request)
 
 	// C3: input flush — drop stale bytes from previous (possibly partial) operation
 	tcflushInput(portNameForFlush)
@@ -277,8 +331,10 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 	if totalRead < finalLen {
 		// M9: jednoznaczny timeout error (categorizeError w broker'rze pozna jako 'timeout',
 		// reconciler nie będzie traktować jako trwałego błędu konfiguracji).
+		dbg("RX timeout: got %d/%d bytes within %v", totalRead, finalLen, requestTimeout)
 		return nil, fmt.Errorf("modbus timeout: got %d/%d bytes within %v", totalRead, finalLen, requestTimeout)
 	}
+	dbgHex("RX", response[:finalLen])
 
 	// Verify slave ID
 	if response[0] != request[0] {
