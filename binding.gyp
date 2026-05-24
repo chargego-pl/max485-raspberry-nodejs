@@ -8,8 +8,12 @@
     "dependencies": [
       "<!(node -p \"require('node-addon-api').gyp\")"
     ],
-    "libraries": ["$(PWD)/libmodbus.so"],
+    "libraries": [
+      "-L<(module_root_dir)",
+      "-lmodbus",
+      "-Wl,-rpath,\\$$ORIGIN/../.."
+    ],
     "cflags!": [ "-fno-exceptions" ],
     "cflags_cc!": [ "-fno-exceptions" ]
   }]
-} 
+}

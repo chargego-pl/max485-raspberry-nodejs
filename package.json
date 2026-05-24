@@ -1,6 +1,6 @@
 {
   "name": "max485-raspberry-nodejs",
-  "version": "3.0.5",
+  "version": "3.0.6",
   "description": "Node.js library for Modbus RTU communication over RS485 using MAX485 transceivers on Raspberry Pi",
   "main": "index.js",
   "scripts": {

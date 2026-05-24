@@ -45,7 +45,12 @@ const (
 	byteSendDelay    = 1 * time.Millisecond
 	postSendDelay    = 3 * time.Millisecond
 	preReceiveDelay  = 1 * time.Millisecond
-	receiveReadDelay = 1 * time.Millisecond
+	receiveReadDelay = 500 * time.Microsecond
+
+	// M9: overall I/O deadline na CAŁY sendModbusRequest (od enableTX do return).
+	// Typowa operacja @ 9600 baud = 24-32 ms. 300ms daje ~10× margin dla edge cases
+	// (slow slave processing, dribbling response). Po deadline zwracamy timeout error.
+	requestTimeout = 300 * time.Millisecond
 )
 
 // ModbusError represents possible Modbus errors
@@ -61,11 +66,15 @@ const (
 
 // NewModbusDevice creates a new Modbus device
 func NewModbusDevice(portName string, baudRate int, dePin, rePin int) (*ModbusDevice, error) {
-	// Configure serial port
+	// Configure serial port.
+	// M9: ReadTimeout = 50ms (zmniejszone z 5s) — pojedynczy port.Read blokuje max 50ms,
+	// dzięki czemu pętla read może sprawdzać overall deadline (requestTimeout=300ms)
+	// granularnie. Wcześniejsze 5s powodowało że pierwsza nieudana iteracja blokowała
+	// cały sendModbusRequest na 5s+ niezależnie od deadlinu.
 	config := &serial.Config{
 		Name:        portName,
 		Baud:        baudRate,
-		ReadTimeout: time.Second * 5,
+		ReadTimeout: 50 * time.Millisecond,
 		Size:        8,
 		Parity:      serial.ParityNone,
 		StopBits:    serial.Stop1,
@@ -217,6 +226,7 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 	// C2: Modbus exception ramka jest KRÓTSZA (5 bajtów: slave, FC|0x80, exceptionCode, CRC, CRC)
 	// niż normalna odpowiedź. Czytamy najpierw min(5, expectedLength) bajtów, peek FC,
 	// jeśli MSB ustawiony — to exception, dalej czytamy do 5 bajtów total. Inaczej do expectedLength.
+	// M9: overall deadline 300ms (zamiast `if n==0 break` które dawało zmienne hangi do 5s).
 	exceptionLen := 5
 	maxLen := expectedLength
 	if exceptionLen > maxLen {
@@ -224,24 +234,23 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 	}
 	response := make([]byte, maxLen)
 	totalRead := 0
+	deadline := time.Now().Add(requestTimeout)
 
 	// Phase 1: czytaj do min(exceptionLen, expectedLength) — wystarczy do detekcji exception
 	phaseTarget := exceptionLen
 	if expectedLength < phaseTarget {
 		phaseTarget = expectedLength
 	}
-	for totalRead < phaseTarget {
+	for totalRead < phaseTarget && time.Now().Before(deadline) {
 		n, err := d.port.Read(response[totalRead:])
-		if err != nil {
-			if err.Error() == "EOF" {
-				break
-			}
+		if err != nil && err.Error() != "EOF" {
 			return nil, fmt.Errorf("failed to read response: %v", err)
 		}
-		if n == 0 {
-			break
+		if n > 0 {
+			totalRead += n
+			continue // bez sleep — może być więcej bajtów w buforze już
 		}
-		totalRead += n
+		// Brak danych teraz; krótka pauza i ponów aż deadline
 		time.Sleep(receiveReadDelay)
 	}
 
@@ -252,24 +261,23 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 		finalLen = exceptionLen
 	}
 
-	// Phase 2: dokończ czytanie do finalLen
-	for totalRead < finalLen {
+	// Phase 2: dokończ czytanie do finalLen z tym samym deadlinem
+	for totalRead < finalLen && time.Now().Before(deadline) {
 		n, err := d.port.Read(response[totalRead:])
-		if err != nil {
-			if err.Error() == "EOF" {
-				break
-			}
+		if err != nil && err.Error() != "EOF" {
 			return nil, fmt.Errorf("failed to read response: %v", err)
 		}
-		if n == 0 {
-			break
+		if n > 0 {
+			totalRead += n
+			continue
 		}
-		totalRead += n
 		time.Sleep(receiveReadDelay)
 	}
 
 	if totalRead < finalLen {
-		return nil, fmt.Errorf("invalid response length: got %d, expected %d", totalRead, finalLen)
+		// M9: jednoznaczny timeout error (categorizeError w broker'rze pozna jako 'timeout',
+		// reconciler nie będzie traktować jako trwałego błędu konfiguracji).
+		return nil, fmt.Errorf("modbus timeout: got %d/%d bytes within %v", totalRead, finalLen, requestTimeout)
 	}
 
 	// Verify slave ID
@@ -417,6 +425,20 @@ func (d *ModbusDevice) ReadInputRegisters(slaveID byte, startAddr uint16, count 
 	return result, nil
 }
 
+// verifyWriteEcho sprawdza echo response dla write operations (FC 05, 06, 0F, 10).
+// Slave Modbus odsyła pierwsze 6 bajtów request'a 1:1 jako potwierdzenie.
+// N4: poprzednio tylko WriteCoil to robił — WriteRegister/WriteMultiple* milczały o
+// niespójności (slave mógł zapisać inną wartość, my byśmy nie wiedzieli).
+func verifyWriteEcho(op string, request, response []byte) error {
+	for i := 0; i < 6; i++ {
+		if response[i] != request[i] {
+			return fmt.Errorf("%s: response echo mismatch at byte %d: got 0x%02X, expected 0x%02X (full got % X expected % X)",
+				op, i, response[i], request[i], response[:6], request[:6])
+		}
+	}
+	return nil
+}
+
 // WriteCoil writes a single coil to a Modbus slave
 func (d *ModbusDevice) WriteCoil(slaveID byte, coilAddr uint16, value bool) error {
 	request := []byte{
@@ -435,18 +457,11 @@ func (d *ModbusDevice) WriteCoil(slaveID byte, coilAddr uint16, value bool) erro
 	if err != nil {
 		return fmt.Errorf("failed to write coil: %v", err)
 	}
-
-	// Verify response matches request
-	if response[0] != request[0] || response[1] != request[1] || 
-	   response[2] != request[2] || response[3] != request[3] ||
-	   response[4] != request[4] || response[5] != request[5] {
-		return fmt.Errorf("response does not match request: got % X, expected % X", response, request)
-	}
-
-	return nil
+	return verifyWriteEcho("write_coil", request, response)
 }
 
-// WriteRegister writes a single holding register to a Modbus slave
+// WriteRegister writes a single holding register to a Modbus slave.
+// N4: weryfikuje echo (poprzednio brak — slave mógł zapisać inną wartość bez ostrzeżenia).
 func (d *ModbusDevice) WriteRegister(slaveID byte, regAddr uint16, value uint16) error {
 	request := []byte{
 		slaveID,
@@ -457,8 +472,11 @@ func (d *ModbusDevice) WriteRegister(slaveID byte, regAddr uint16, value uint16)
 		byte(value & 0xFF),
 	}
 
-	_, err := d.sendModbusRequest(request, 8)
-	return err
+	response, err := d.sendModbusRequest(request, 8)
+	if err != nil {
+		return fmt.Errorf("failed to write register: %v", err)
+	}
+	return verifyWriteEcho("write_register", request, response)
 }
 
 // WriteMultipleCoils writes multiple coils to a Modbus slave
@@ -479,11 +497,18 @@ func (d *ModbusDevice) WriteMultipleCoils(slaveID byte, startAddr uint16, values
 		}
 	}
 
-	_, err := d.sendModbusRequest(request, 8)
-	return err
+	// N4: response = [slave, FC, addr_hi, addr_lo, qty_hi, qty_lo, CRC, CRC] = 8 bytes.
+	// Pierwsze 6 bajtów = echo żądania (bez byteCount + data + CRC).
+	response, err := d.sendModbusRequest(request, 8)
+	if err != nil {
+		return fmt.Errorf("failed to write multiple coils: %v", err)
+	}
+	return verifyWriteEcho("write_multiple_coils", request, response)
 }
 
-// WriteMultipleRegisters writes multiple holding registers to a Modbus slave
+// WriteMultipleRegisters writes multiple holding registers to a Modbus slave.
+// N4: weryfikuje echo response (poprzednio brak — slave mógł napisać inną liczbę
+// rejestrów / na innym adresie a my byśmy tego nie wiedzieli).
 func (d *ModbusDevice) WriteMultipleRegisters(slaveID byte, startAddr uint16, values []uint16) error {
 	request := make([]byte, 7+2*len(values))
 	request[0] = slaveID
@@ -499,8 +524,11 @@ func (d *ModbusDevice) WriteMultipleRegisters(slaveID byte, startAddr uint16, va
 		request[8+2*i] = byte(value & 0xFF)
 	}
 
-	_, err := d.sendModbusRequest(request, 8)
-	return err
+	response, err := d.sendModbusRequest(request, 8)
+	if err != nil {
+		return fmt.Errorf("failed to write multiple registers: %v", err)
+	}
+	return verifyWriteEcho("write_multiple_registers", request, response)
 }
 
 func main() {
