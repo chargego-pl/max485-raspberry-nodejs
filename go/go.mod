@@ -6,7 +6,10 @@ toolchain go1.23.7
 
 require (
 	github.com/stianeikeland/go-rpio/v4 v4.6.0
-	github.com/tarm/serial v0.0.0-20180830185346-98f6abe2eb07
+	go.bug.st/serial v1.6.4
 )
 
-require golang.org/x/sys v0.31.0 // indirect
+require (
+	github.com/creack/goselect v0.1.2 // indirect
+	golang.org/x/sys v0.31.0 // indirect
+)

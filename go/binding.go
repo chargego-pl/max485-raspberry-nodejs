@@ -213,17 +213,13 @@ func getDeviceArg(env C.napi_env, v C.napi_value, name string) (*ModbusDevice, b
     return d, true
 }
 
-// returnErrorString — biblioteka historycznie zwraca błędy jako string "Error: ..."
-// (index.js sprawdza result.startsWith('Error:') i throw'uje). Nie zmieniamy tej
-// konwencji żeby nie psuć backward compat z v3.0.x consumers.
-func returnErrorString(env C.napi_env, err error) C.napi_value {
-    msg := "Error: " + err.Error()
-    cs := C.CString(msg)
-    defer C.free(unsafe.Pointer(cs))
-    var r C.napi_value
-    C.napi_create_string_utf8(env, cs, C.size_t(len(msg)), &r)
-    return r
-}
+// M7 (v4.0.0): wszystkie błędy operacji bus → napi_throw_error → JS dostaje
+// natywny throw (await odrzuca). Wcześniej zwracaliśmy string "Error: ..." i
+// index.js robił `result.startsWith('Error:') && throw new Error(result)` —
+// fragile (pomyłka konwencji = błąd cicho ignorowany), nieczytelny stack trace,
+// brak typed errors (ModbusException już nie odróżnialny od generic).
+// BREAKING: consumers nie polegający na await/try-catch (np. .then bez .catch)
+// muszą się dostosować. v3.x → v4.0 wymaga porządnego try/catch wokół async ops.
 
 func returnJSON(env C.napi_env, v interface{}) C.napi_value {
     data, _ := json.Marshal(v)
@@ -294,7 +290,7 @@ func ReadCoilsJS(env C.napi_env, info C.napi_callback_info) C.napi_value {
     startAddr, ok := getUint16Arg(env, args[2], "startAddr"); if !ok { return undef(env) }
     count, ok := getUint16Arg(env, args[3], "count"); if !ok { return undef(env) }
     values, err := device.ReadCoils(byte(slaveID), uint16(startAddr), uint16(count))
-    if err != nil { return returnErrorString(env, err) }
+    if err != nil { return napiThrow(env, err.Error()) }
     return returnJSON(env, values)
 }
 
@@ -306,7 +302,7 @@ func ReadDiscreteInputsJS(env C.napi_env, info C.napi_callback_info) C.napi_valu
     startAddr, ok := getUint16Arg(env, args[2], "startAddr"); if !ok { return undef(env) }
     count, ok := getUint16Arg(env, args[3], "count"); if !ok { return undef(env) }
     values, err := device.ReadDiscreteInputs(byte(slaveID), uint16(startAddr), uint16(count))
-    if err != nil { return returnErrorString(env, err) }
+    if err != nil { return napiThrow(env, err.Error()) }
     return returnJSON(env, values)
 }
 
@@ -318,7 +314,7 @@ func ReadHoldingRegistersJS(env C.napi_env, info C.napi_callback_info) C.napi_va
     startAddr, ok := getUint16Arg(env, args[2], "startAddr"); if !ok { return undef(env) }
     count, ok := getUint16Arg(env, args[3], "count"); if !ok { return undef(env) }
     values, err := device.ReadHoldingRegisters(byte(slaveID), uint16(startAddr), uint16(count))
-    if err != nil { return returnErrorString(env, err) }
+    if err != nil { return napiThrow(env, err.Error()) }
     return returnJSON(env, values)
 }
 
@@ -330,7 +326,7 @@ func ReadInputRegistersJS(env C.napi_env, info C.napi_callback_info) C.napi_valu
     startAddr, ok := getUint16Arg(env, args[2], "startAddr"); if !ok { return undef(env) }
     count, ok := getUint16Arg(env, args[3], "count"); if !ok { return undef(env) }
     values, err := device.ReadInputRegisters(byte(slaveID), uint16(startAddr), uint16(count))
-    if err != nil { return returnErrorString(env, err) }
+    if err != nil { return napiThrow(env, err.Error()) }
     return returnJSON(env, values)
 }
 
@@ -342,7 +338,7 @@ func WriteCoilJS(env C.napi_env, info C.napi_callback_info) C.napi_value {
     coilAddr, ok := getUint16Arg(env, args[2], "coilAddr"); if !ok { return undef(env) }
     value, ok := getBoolArg(env, args[3], "value"); if !ok { return undef(env) }
     err := device.WriteCoil(byte(slaveID), uint16(coilAddr), value)
-    if err != nil { return returnErrorString(env, err) }
+    if err != nil { return napiThrow(env, err.Error()) }
     return C.create_success(env)
 }
 
@@ -354,7 +350,7 @@ func WriteRegisterJS(env C.napi_env, info C.napi_callback_info) C.napi_value {
     regAddr, ok := getUint16Arg(env, args[2], "regAddr"); if !ok { return undef(env) }
     value, ok := getUint16Arg(env, args[3], "value"); if !ok { return undef(env) }
     err := device.WriteRegister(byte(slaveID), uint16(regAddr), uint16(value))
-    if err != nil { return returnErrorString(env, err) }
+    if err != nil { return napiThrow(env, err.Error()) }
     return C.create_success(env)
 }
 
@@ -387,7 +383,7 @@ func WriteMultipleCoilsJS(env C.napi_env, info C.napi_callback_info) C.napi_valu
         goValues[i] = v
     }
     err := device.WriteMultipleCoils(byte(slaveID), uint16(startAddr), goValues)
-    if err != nil { return returnErrorString(env, err) }
+    if err != nil { return napiThrow(env, err.Error()) }
     return C.create_success(env)
 }
 
@@ -417,7 +413,7 @@ func WriteMultipleRegistersJS(env C.napi_env, info C.napi_callback_info) C.napi_
         goValues[i] = uint16(v)
     }
     err := device.WriteMultipleRegisters(byte(slaveID), uint16(startAddr), goValues)
-    if err != nil { return returnErrorString(env, err) }
+    if err != nil { return napiThrow(env, err.Error()) }
     return C.create_success(env)
 }
 

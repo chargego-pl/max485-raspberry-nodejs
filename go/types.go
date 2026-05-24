@@ -4,7 +4,7 @@ import (
 	"sync"
 
 	"github.com/stianeikeland/go-rpio/v4"
-	"github.com/tarm/serial"
+	"go.bug.st/serial"
 )
 
 // ModbusDevice represents a Modbus RTU device.
@@ -12,8 +12,10 @@ import (
 // THREAD SAFETY: methods that touch the bus (Read*, Write*, sendModbusRequest)
 // acquire `mu` for the duration of the operation. Multiple goroutines may call
 // methods concurrently — they will be serialized on the bus, not interleaved.
+//
+// v4.0.0: port to interface go.bug.st/serial.Port (zamiast *tarm/serial.Port).
 type ModbusDevice struct {
-	port   *serial.Port
+	port   serial.Port
 	dePin  rpio.Pin
 	rePin  rpio.Pin
 	mu     sync.Mutex

@@ -7,11 +7,10 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"syscall"
 	"time"
 
 	"github.com/stianeikeland/go-rpio/v4"
-	"github.com/tarm/serial"
+	"go.bug.st/serial"
 )
 
 // N5: debug logging behind env var MAX485_DEBUG=1 (lub =hex dla pełnego dump TX/RX).
@@ -33,40 +32,24 @@ func dbgHex(label string, data []byte) {
 	fmt.Fprintf(os.Stderr, "[max485] %s: %s\n", label, hex.EncodeToString(data))
 }
 
-// Const TCFLSH ioctl for input buffer flush (Linux). Manually defined żeby uniknąć
-// zależności od golang.org/x/sys/unix (utrzymujemy minimalne deps biblioteki).
-const (
-	ioctlTCFLSH = 0x540B
-	tcIFlush    = 0 // flush input only (kierunek RX kernel buffer)
-)
-
-// tcflushInput czyści input bufor PL011 RX (resztki z poprzednich operacji, noise idle).
-// Powinien być zawołany PRZED enableTX żeby slave odpowiedź była czysta.
-// rawFd otwieramy ad-hoc — niewielki overhead (<200µs) ale eliminuje C3 (corrupted state recovery).
-func tcflushInput(portName string) {
-	fd, err := syscall.Open(portName, syscall.O_RDWR|syscall.O_NOCTTY, 0)
-	if err != nil {
-		return
-	}
-	defer syscall.Close(fd)
-	syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(ioctlTCFLSH), uintptr(tcIFlush))
-}
-
-// portName trzymane jako var package żeby tcflushInput miał ścieżkę bez dotykania struct
-// (struct definiowany w types.go).
-var portNameForFlush string
-
-// Timing configuration
+// Timing configuration.
+//
+// v4.0.0: migracja na go.bug.st/serial eliminuje większość workaroundów:
+// - byteSendDelay → 0 (port.Write blokuje do FIFO copy; Drain() później czeka na drain)
+// - postSendDelay → 0 (port.Drain() = real blocking wait na HW FIFO empty)
+// - tcflushInput → port.ResetInputBuffer() (native API)
+// - read deadline → port.SetReadTimeout(requestTimeout) (native)
 const (
 	// GPIO pin switching delays
 	gpioSwitchDelay = 1 * time.Microsecond
 
-	// Serial communication delays
-	preSendDelay     = 0 * time.Millisecond
-	byteSendDelay    = 1 * time.Millisecond
-	postSendDelay    = 3 * time.Millisecond
-	preReceiveDelay  = 1 * time.Millisecond
-	receiveReadDelay = 500 * time.Microsecond
+	// Pre-send GPIO settling: enableTX → tx_start
+	preSendDelay = 0 * time.Millisecond
+
+	// Pre-receive GPIO settling: enableRX → first read
+	// Slave Modbus standard: ≥3.5 char inter-frame gap (~3.6ms @ 9600).
+	// W praktyce slave odpowiada po ~5ms; my chcemy być w RX gdy zaczyna nadawać.
+	preReceiveDelay = 1 * time.Millisecond
 
 	// M9: overall I/O deadline na CAŁY sendModbusRequest (od enableTX do return).
 	// Typowa operacja @ 9600 baud = 24-32 ms. 300ms daje ~10× margin dla edge cases
@@ -87,26 +70,18 @@ const (
 
 // NewModbusDevice creates a new Modbus device.
 //
+// v4.0.0: użycie go.bug.st/serial.v1 API — Open(name, *Mode) zamiast OpenPort(*Config).
 // M3: defensive cleanup pattern — `success` flag + defer cleanup. Każdy step
 // init może zawieść; jeśli zawiedzie po częściowej alokacji, defer cleanup
-// zamyka co już zostało otwarte (port, rpio.Open). Bez tego partial init
-// leaks resources (port.Close nie wywołane, GPIO mmap leak).
+// zamyka co już zostało otwarte (port). rpio.Close NIE wywoływane bo process-global.
 func NewModbusDevice(portName string, baudRate int, dePin, rePin int) (*ModbusDevice, error) {
-	// Configure serial port.
-	// M9: ReadTimeout = 50ms (zmniejszone z 5s) — pojedynczy port.Read blokuje max 50ms,
-	// dzięki czemu pętla read może sprawdzać overall deadline (requestTimeout=300ms)
-	// granularnie. Wcześniejsze 5s powodowało że pierwsza nieudana iteracja blokowała
-	// cały sendModbusRequest na 5s+ niezależnie od deadlinu.
-	config := &serial.Config{
-		Name:        portName,
-		Baud:        baudRate,
-		ReadTimeout: 50 * time.Millisecond,
-		Size:        8,
-		Parity:      serial.ParityNone,
-		StopBits:    serial.Stop1,
+	mode := &serial.Mode{
+		BaudRate: baudRate,
+		DataBits: 8,
+		Parity:   serial.NoParity,
+		StopBits: serial.OneStopBit,
 	}
-
-	port, err := serial.OpenPort(config)
+	port, err := serial.Open(portName, mode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open serial port: %v", err)
 	}
@@ -117,27 +92,22 @@ func NewModbusDevice(portName string, baudRate int, dePin, rePin int) (*ModbusDe
 			_ = port.Close()
 		}
 	}()
-	portNameForFlush = portName // C3: zapamiętaj do tcflushInput
 
-	// Set additional port parameters
-	if err := port.Flush(); err != nil {
-		return nil, fmt.Errorf("failed to flush port: %v", err)
+	// SetReadTimeout — używamy short timeout (50ms), pętla read sprawdza overall deadline.
+	// bug.st obsługuje natywnie (zamiast trym/serial 5s blocking workaround).
+	if err := port.SetReadTimeout(50 * time.Millisecond); err != nil {
+		return nil, fmt.Errorf("failed to set read timeout: %v", err)
 	}
 
-	// Initialize GPIO
+	// Initialize GPIO. rpio.Open jest process-global (vide M1 z review).
 	if err := rpio.Open(); err != nil {
 		return nil, fmt.Errorf("failed to initialize GPIO: %v", err)
 	}
-	// rpio.Close jest process-global (vide M1 z review) — NIE wywołujemy w defer
-	// nawet przy partial init, bo mogłby ubić inny ModbusDevice. Akceptujemy
-	// rzadki small leak rpio mmap (~4KB) jako trade-off.
 
 	de := rpio.Pin(dePin)
 	re := rpio.Pin(rePin)
-
 	de.Output()
 	re.Output()
-
 	// Set initial state to receive mode (idle, bus zwolniony)
 	de.Low()
 	re.Low()
@@ -224,10 +194,10 @@ func (d *ModbusDevice) enableRX() {
 
 // sendModbusRequest sends a Modbus request and waits for response.
 //
-// C1 (thread-safe): mutex chroni cały cykl TX→RX. Concurrent callers są serializowane,
-// nigdy nie interleave bajtów na busie.
-// C3 (state recovery): tcflushInput przed enableTX czyści śmieci w buforze RX po
-// poprzedniej operacji (jeśli była partial / aborted).
+// v4.0.0: blokowy write + native Drain() zamiast byte-by-byte + sleep workarounds.
+// C1 (thread-safe): mutex chroni cały cykl TX→RX.
+// C3 (state recovery): port.ResetInputBuffer() przed TX czyści śmieci po previous op.
+// M9: deadline-based read loop (port.SetReadTimeout 50ms granularity + overall 300ms).
 func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]byte, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -236,9 +206,7 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 		return nil, fmt.Errorf("modbus device is closed")
 	}
 
-	// N3: defensive copy — append może realloc'ować lub aliassować caller's slice.
-	// Wszystkie callerzy w tym pliku (Read*/Write*) tworzą fresh slice więc nie ma
-	// real shadow bug, ALE explicit copy chroni przed potencjalnym reuse w przyszłości.
+	// N3: defensive copy — frame buffer w pełni kontrolujemy.
 	bodyLen := len(request)
 	frame := make([]byte, bodyLen+2)
 	copy(frame, request)
@@ -248,39 +216,34 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 	request = frame
 	dbgHex("TX", request)
 
-	// C3: input flush — drop stale bytes from previous (possibly partial) operation
-	tcflushInput(portNameForFlush)
-
-	// Send request
-	d.enableTX()
-	time.Sleep(preSendDelay)
-
-	// Send data byte by byte
-	for i, b := range request {
-		n, err := d.port.Write([]byte{b})
-		if err != nil {
-			return nil, fmt.Errorf("failed to write byte %d: %v", i, err)
-		}
-		if n != 1 {
-			return nil, fmt.Errorf("failed to write byte %d: wrote %d bytes", i, n)
-		}
-		time.Sleep(byteSendDelay)
+	// C3: drop stale bytes from previous (possibly partial) operation — native API z bug.st.
+	if err := d.port.ResetInputBuffer(); err != nil {
+		return nil, fmt.Errorf("failed to reset input buffer: %v", err)
 	}
 
-	// Wait for transmission to complete
-	time.Sleep(postSendDelay)
-
-	// Wait for response
+	// Enable TX, then write frame as single block (PL011 FIFO mieści całą ramkę).
+	d.enableTX()
+	time.Sleep(preSendDelay)
+	n, err := d.port.Write(request)
+	if err != nil {
+		return nil, fmt.Errorf("write: %v", err)
+	}
+	if n != len(request) {
+		return nil, fmt.Errorf("short write: %d of %d", n, len(request))
+	}
+	// Q2 SOLVED: port.Drain() — blokujący wait na fizyczne opróżnienie HW UART TX FIFO.
+	// Eliminuje stary "blind" postSendDelay 3ms guess. Gwarantowane: po return,
+	// ostatni bajt już wyszedł na drut → bezpiecznie zwolnić DE.
+	if err := d.port.Drain(); err != nil {
+		return nil, fmt.Errorf("drain: %v", err)
+	}
 	d.enableRX()
-	
-	// Add a small delay to ensure the device has time to respond
 	time.Sleep(preReceiveDelay)
-	
+
 	// Read response.
 	// C2: Modbus exception ramka jest KRÓTSZA (5 bajtów: slave, FC|0x80, exceptionCode, CRC, CRC)
 	// niż normalna odpowiedź. Czytamy najpierw min(5, expectedLength) bajtów, peek FC,
 	// jeśli MSB ustawiony — to exception, dalej czytamy do 5 bajtów total. Inaczej do expectedLength.
-	// M9: overall deadline 300ms (zamiast `if n==0 break` które dawało zmienne hangi do 5s).
 	exceptionLen := 5
 	maxLen := expectedLength
 	if exceptionLen > maxLen {
@@ -290,22 +253,20 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 	totalRead := 0
 	deadline := time.Now().Add(requestTimeout)
 
-	// Phase 1: czytaj do min(exceptionLen, expectedLength) — wystarczy do detekcji exception
+	// Phase 1: czytaj do min(exceptionLen, expectedLength) — wystarczy do detekcji exception.
+	// port.Read blokuje max 50ms (SetReadTimeout), więc pętla sprawdza overall deadline często.
 	phaseTarget := exceptionLen
 	if expectedLength < phaseTarget {
 		phaseTarget = expectedLength
 	}
 	for totalRead < phaseTarget && time.Now().Before(deadline) {
 		n, err := d.port.Read(response[totalRead:])
-		if err != nil && err.Error() != "EOF" {
+		if err != nil {
 			return nil, fmt.Errorf("failed to read response: %v", err)
 		}
 		if n > 0 {
 			totalRead += n
-			continue // bez sleep — może być więcej bajtów w buforze już
 		}
-		// Brak danych teraz; krótka pauza i ponów aż deadline
-		time.Sleep(receiveReadDelay)
 	}
 
 	// Detekcja exception: FC|0x80 (bit 7 set)
@@ -318,19 +279,15 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 	// Phase 2: dokończ czytanie do finalLen z tym samym deadlinem
 	for totalRead < finalLen && time.Now().Before(deadline) {
 		n, err := d.port.Read(response[totalRead:])
-		if err != nil && err.Error() != "EOF" {
+		if err != nil {
 			return nil, fmt.Errorf("failed to read response: %v", err)
 		}
 		if n > 0 {
 			totalRead += n
-			continue
 		}
-		time.Sleep(receiveReadDelay)
 	}
 
 	if totalRead < finalLen {
-		// M9: jednoznaczny timeout error (categorizeError w broker'rze pozna jako 'timeout',
-		// reconciler nie będzie traktować jako trwałego błędu konfiguracji).
 		dbg("RX timeout: got %d/%d bytes within %v", totalRead, finalLen, requestTimeout)
 		return nil, fmt.Errorf("modbus timeout: got %d/%d bytes within %v", totalRead, finalLen, requestTimeout)
 	}
