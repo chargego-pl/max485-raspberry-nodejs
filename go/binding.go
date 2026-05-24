@@ -43,6 +43,17 @@ static napi_value create_error(napi_env env, const char* message) {
     return error;
 }
 
+// M6 FIX: prawdziwy JS throw (zamiast return Error object jako value).
+// Wcześniej NewModbusDeviceJS zwracało Error na connect failure, index.js
+// zapisywał to jako this.device (truthy!), kolejne wywołania crashowały
+// Go z nil pointer panic. Throw → JS musi try/catch, propagacja jasna.
+static napi_value throw_error(napi_env env, const char* message) {
+    napi_throw_error(env, NULL, message);
+    napi_value undef;
+    napi_get_undefined(env, &undef);
+    return undef;
+}
+
 // Helper function to create success response
 static napi_value create_success(napi_env env) {
     napi_value result;
@@ -102,9 +113,10 @@ func NewModbusDeviceJS(env C.napi_env, info C.napi_callback_info) C.napi_value {
 
     device, err := NewModbusDevice(portStr, int(baudRate), int(dePin), int(rePin))
     if err != nil {
+        // M6: throw zamiast return Error object — JS dostaje exception
         errStr := C.CString(err.Error())
         defer C.free(unsafe.Pointer(errStr))
-        return C.create_error(env, errStr)
+        return C.throw_error(env, errStr)
     }
 
     // Zapakuj *ModbusDevice w cgo.Handle (Go 1.17+) — Go GC nie ruszy

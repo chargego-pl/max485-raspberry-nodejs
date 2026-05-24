@@ -5,11 +5,35 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"syscall"
 	"time"
 
 	"github.com/stianeikeland/go-rpio/v4"
 	"github.com/tarm/serial"
 )
+
+// Const TCFLSH ioctl for input buffer flush (Linux). Manually defined żeby uniknąć
+// zależności od golang.org/x/sys/unix (utrzymujemy minimalne deps biblioteki).
+const (
+	ioctlTCFLSH = 0x540B
+	tcIFlush    = 0 // flush input only (kierunek RX kernel buffer)
+)
+
+// tcflushInput czyści input bufor PL011 RX (resztki z poprzednich operacji, noise idle).
+// Powinien być zawołany PRZED enableTX żeby slave odpowiedź była czysta.
+// rawFd otwieramy ad-hoc — niewielki overhead (<200µs) ale eliminuje C3 (corrupted state recovery).
+func tcflushInput(portName string) {
+	fd, err := syscall.Open(portName, syscall.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		return
+	}
+	defer syscall.Close(fd)
+	syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(ioctlTCFLSH), uintptr(tcIFlush))
+}
+
+// portName trzymane jako var package żeby tcflushInput miał ścieżkę bez dotykania struct
+// (struct definiowany w types.go).
+var portNameForFlush string
 
 // Timing configuration
 const (
@@ -51,6 +75,7 @@ func NewModbusDevice(portName string, baudRate int, dePin, rePin int) (*ModbusDe
 	if err != nil {
 		return nil, fmt.Errorf("failed to open serial port: %v", err)
 	}
+	portNameForFlush = portName // C3: zapamiętaj do tcflushInput
 
 	// Set additional port parameters
 	if err := port.Flush(); err != nil {
@@ -83,6 +108,13 @@ func NewModbusDevice(portName string, baudRate int, dePin, rePin int) (*ModbusDe
 
 // Close closes the Modbus device
 func (d *ModbusDevice) Close() {
+	// M2: idempotent — drugie wywołanie no-op (zamiast double-free / panic).
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return
+	}
+	d.closed = true
 	// STABILITY: wymuś stan RX (driver disabled, receiver enabled) przed close.
 	// Bez tego po crash/SIGKILL pin DE pozostawałby HIGH → ISL napędza bus
 	// stale → bus zablokowany dla innych masterów. Kolejność jak w enableRX().
@@ -90,8 +122,10 @@ func (d *ModbusDevice) Close() {
 	d.dePin.Low()
 	if d.port != nil {
 		d.port.Close()
+		d.port = nil
 	}
-	rpio.Close()
+	// rpio.Close() celowo NIE wywoływane — proces-global mmap, drugi ModbusDevice
+	// musiałby ponownie Open. Process exit oczyści zasoby.
 }
 
 // calculateCRC calculates CRC-16 for Modbus RTU
@@ -133,11 +167,26 @@ func (d *ModbusDevice) enableRX() {
 	time.Sleep(gpioSwitchDelay)
 }
 
-// sendModbusRequest sends a Modbus request and waits for response
+// sendModbusRequest sends a Modbus request and waits for response.
+//
+// C1 (thread-safe): mutex chroni cały cykl TX→RX. Concurrent callers są serializowane,
+// nigdy nie interleave bajtów na busie.
+// C3 (state recovery): tcflushInput przed enableTX czyści śmieci w buforze RX po
+// poprzedniej operacji (jeśli była partial / aborted).
 func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.closed {
+		return nil, fmt.Errorf("modbus device is closed")
+	}
+
 	// Add CRC to request
 	crc := calculateCRC(request)
 	request = append(request, byte(crc&0xFF), byte(crc>>8))
+
+	// C3: input flush — drop stale bytes from previous (possibly partial) operation
+	tcflushInput(portNameForFlush)
 
 	// Send request
 	d.enableTX()
@@ -164,12 +213,24 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 	// Add a small delay to ensure the device has time to respond
 	time.Sleep(preReceiveDelay)
 	
-	// Read response with timeout
-	response := make([]byte, expectedLength)
+	// Read response.
+	// C2: Modbus exception ramka jest KRÓTSZA (5 bajtów: slave, FC|0x80, exceptionCode, CRC, CRC)
+	// niż normalna odpowiedź. Czytamy najpierw min(5, expectedLength) bajtów, peek FC,
+	// jeśli MSB ustawiony — to exception, dalej czytamy do 5 bajtów total. Inaczej do expectedLength.
+	exceptionLen := 5
+	maxLen := expectedLength
+	if exceptionLen > maxLen {
+		maxLen = exceptionLen
+	}
+	response := make([]byte, maxLen)
 	totalRead := 0
-	
-	// Try to read all expected bytes
-	for totalRead < expectedLength {
+
+	// Phase 1: czytaj do min(exceptionLen, expectedLength) — wystarczy do detekcji exception
+	phaseTarget := exceptionLen
+	if expectedLength < phaseTarget {
+		phaseTarget = expectedLength
+	}
+	for totalRead < phaseTarget {
 		n, err := d.port.Read(response[totalRead:])
 		if err != nil {
 			if err.Error() == "EOF" {
@@ -183,9 +244,32 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 		totalRead += n
 		time.Sleep(receiveReadDelay)
 	}
-	
-	if totalRead < expectedLength {
-		return nil, fmt.Errorf("invalid response length: got %d, expected %d", totalRead, expectedLength)
+
+	// Detekcja exception: FC|0x80 (bit 7 set)
+	isException := totalRead >= 2 && (response[1]&0x80) != 0
+	finalLen := expectedLength
+	if isException {
+		finalLen = exceptionLen
+	}
+
+	// Phase 2: dokończ czytanie do finalLen
+	for totalRead < finalLen {
+		n, err := d.port.Read(response[totalRead:])
+		if err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			return nil, fmt.Errorf("failed to read response: %v", err)
+		}
+		if n == 0 {
+			break
+		}
+		totalRead += n
+		time.Sleep(receiveReadDelay)
+	}
+
+	if totalRead < finalLen {
+		return nil, fmt.Errorf("invalid response length: got %d, expected %d", totalRead, finalLen)
 	}
 
 	// Verify slave ID
@@ -193,19 +277,28 @@ func (d *ModbusDevice) sendModbusRequest(request []byte, expectedLength int) ([]
 		return nil, fmt.Errorf("invalid slave ID in response: got %d, expected %d", response[0], request[0])
 	}
 
-	// Verify function code
-	if response[1] != request[1] {
-		return nil, fmt.Errorf("invalid function code in response: got %d, expected %d", response[1], request[1])
-	}
-
-	// Verify CRC
-	receivedCRC := binary.LittleEndian.Uint16(response[totalRead-2:])
-	calculatedCRC := calculateCRC(response[:totalRead-2])
+	// Verify CRC (przed function code check — gdyby CRC był zły, FC mismatch nieistotny)
+	receivedCRC := binary.LittleEndian.Uint16(response[finalLen-2:])
+	calculatedCRC := calculateCRC(response[:finalLen-2])
 	if receivedCRC != calculatedCRC {
 		return nil, fmt.Errorf("CRC error: received %04X, calculated %04X", receivedCRC, calculatedCRC)
 	}
 
-	return response, nil
+	// C2: jeśli exception, zwróć typed error z exceptionCode zamiast generic FC mismatch
+	if isException {
+		return nil, &ModbusException{
+			SlaveID:       response[0],
+			FunctionCode:  request[1],
+			ExceptionCode: response[2],
+		}
+	}
+
+	// Verify function code (normalna odpowiedź — FC musi się zgadzać)
+	if response[1] != request[1] {
+		return nil, fmt.Errorf("invalid function code in response: got %d, expected %d", response[1], request[1])
+	}
+
+	return response[:finalLen], nil
 }
 
 // ReadCoils reads coils from a Modbus slave
