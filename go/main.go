@@ -78,18 +78,28 @@ const (
 	readSliceTimeout = 50 * time.Millisecond
 )
 
-// ifg liczy 3.5-character inter-frame gap dla danego baud rate (Modbus RTU spec).
-// @ 9600/8N1: 3.5 * 11 bits / 9600 = ~4ms. @ 115200: ~0.33ms.
-// Spec: między dwoma ramkami musi być ≥3.5 char silence; nasze IFG używamy:
-//   1. Po Drain() przed enableRX() — daje slave'owi szansę zacząć nadawać.
-//   2. Po ResetInputBuffer() przed Write() — bus settle, last byte poprzedniej
-//      operacji wchodzi do bufora i jest jeszcze raz wyzerowany w razie czego.
+// REGRESSION FIX 2026-05-24: EXACT v3.0.7 timing emulation.
+//
+// bug.st Drain() jest UNRELIABLE (empirycznie 0-20% success na slave 31).
+// Wracamy do v3.0.7 sync write model: byte-by-byte write z 1ms sleep per byte
+// daje DETERMINISTYCZNE blokowanie ekwiwalentne Drain'owi.
+//
+// 50-op stress test na bench (slave 31):
+//   v3.0.7:           50/50 = 100% success
+//   v4.0.0 z Drain:   0-20% (varies)
+//   v4.0.0 byte-byte: TBD (powinno = v3.0.7)
+const (
+	byteSendDelay    = 1 * time.Millisecond
+	postSendDelay    = 3 * time.Millisecond
+	preReceiveDelay  = 500 * time.Microsecond
+	receiveReadDelay = 500 * time.Microsecond
+)
+
+// ifg — UNUSED w hot path (regresja). Zostawione jako helper informational.
 func (d *ModbusDevice) ifg() time.Duration {
 	if d.baudRate <= 0 {
-		return 4 * time.Millisecond // safe fallback
+		return 4 * time.Millisecond
 	}
-	// 3.5 char * 11 bits = 38.5 bit periods. period_us = 1e6 / baud.
-	// total_us = 38_500_000 / baud.
 	us := 38500000 / d.baudRate
 	if us < 1 {
 		us = 1
@@ -388,42 +398,55 @@ func (d *ModbusDevice) sendOnce(request []byte, expectedLength int) ([]byte, err
 	expectedSlaveID := request[0]
 	expectedFC := request[1]
 
-	// F2.2 / A7: bus settle + reset stale bytes (tail-end poprzedniej operacji).
-	// ifg() = 3.5 char @ baud — daje czas żeby ostatni byte wszedł do bufora.
+	// REGRESSION FIX 2026-05-24: powrót do v3.0.7 timing/flow w hot path.
+	// A7 (slaveID skip-until-match + double reset + ifg-before-write) wprowadził
+	// 50% timeout na slave 31. v3.0.7 z pojedynczym ResetInputBuffer + bez sleep
+	// przed read był 100%. Wracamy do v3.0.7 model w sendOnce.
+	//
+	// expectedSlaveID — unused tutaj (gdy A7 wycofany), ale zachowany w
+	// CRC/exception checkach niżej.
+	_ = expectedSlaveID
+
+	// C3: drop stale bytes from previous (possibly partial) operation.
 	if err := d.port.ResetInputBuffer(); err != nil {
 		return nil, fmt.Errorf("failed to reset input buffer: %v", err)
 	}
-	time.Sleep(d.ifg())
-	// Second reset — wszystko co przybyło w trakcie settle.
-	if err := d.port.ResetInputBuffer(); err != nil {
-		return nil, fmt.Errorf("failed to reset input buffer (2nd pass): %v", err)
-	}
 
-	// Enable TX, write frame, drain to HW FIFO empty, switch to RX.
+	// Enable TX, write frame byte-by-byte (sync emulation Drain), switch to RX.
 	if err := d.transceiver.EnableTX(); err != nil {
 		return nil, fmt.Errorf("transceiver enable TX: %v", err)
 	}
 	d.stats.markTx()
-	n, err := d.port.Write(frame)
-	if err != nil {
-		_ = d.transceiver.EnableRX()
-		return nil, fmt.Errorf("write: %v", err)
+
+	// v3.0.7 byte-by-byte send z 1ms sleep per byte. To efektywnie blokuje
+	// całość transmission @ 9600 = ~11ms (1ms/byte) zamiast polegania na
+	// bug.st Drain() który jest unreliable.
+	for i, b := range frame {
+		nByte, err := d.port.Write([]byte{b})
+		if err != nil {
+			_ = d.transceiver.EnableRX()
+			return nil, fmt.Errorf("write byte %d: %v", i, err)
+		}
+		if nByte != 1 {
+			_ = d.transceiver.EnableRX()
+			return nil, fmt.Errorf("short write byte %d: %d of 1", i, nByte)
+		}
+		time.Sleep(byteSendDelay)
 	}
-	if n != len(frame) {
-		_ = d.transceiver.EnableRX()
-		return nil, fmt.Errorf("short write: %d of %d", n, len(frame))
-	}
-	if err := d.port.Drain(); err != nil {
-		_ = d.transceiver.EnableRX()
-		return nil, fmt.Errorf("drain: %v", err)
-	}
+
+	// postSendDelay 3ms — pewność że ostatni byte wyszedł fizycznie z FIFO
+	// (kernel UART write blokuje do kopii do FIFO, nie do drut'a).
+	time.Sleep(postSendDelay)
+
 	if err := d.transceiver.EnableRX(); err != nil {
 		return nil, fmt.Errorf("transceiver enable RX: %v", err)
 	}
-	// F1.2 + spec — slave używa IFG do detekcji frame boundary; dajemy chwilę.
-	time.Sleep(d.ifg())
+	// preReceiveDelay 500µs — chwila na settle slave PRZED first read.
+	time.Sleep(preReceiveDelay)
 
-	// Read response z deadline'em i F2.2 slaveID skip-until-match.
+	// Read response z deadline'em — DIRECT read (jak v3.0.7), bez skip-until-match.
+	// CRC verify wyłapie skorumpowane bajty; lepiej żeby CRC error wyszedł na
+	// górę (consumer retry'uje) niż żebyśmy cicho dropowali bajty i timeoutowali.
 	exceptionLen := 5
 	maxLen := expectedLength
 	if exceptionLen > maxLen {
@@ -432,45 +455,29 @@ func (d *ModbusDevice) sendOnce(request []byte, expectedLength int) ([]byte, err
 	response := make([]byte, maxLen)
 	totalRead := 0
 	deadline := time.Now().Add(requestTimeout)
+	rxMarked := false
 
-	// F2.2: skip-until-slaveID. Czytamy do bufora pomocniczego dopóki nie
-	// trafimy na byte == expectedSlaveID. Stray bytes (od poprzedniego slave'a
-	// który łamie spec i odpowiedział po deadline'ie) są dropped + logged.
-	tmpBuf := make([]byte, 1)
-	for totalRead == 0 && time.Now().Before(deadline) {
-		nRead, err := d.port.Read(tmpBuf)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read response: %v", err)
-		}
-		if nRead == 0 {
-			continue
-		}
-		if tmpBuf[0] == expectedSlaveID {
-			response[0] = tmpBuf[0]
-			totalRead = 1
-			d.stats.markRx()
-			break
-		}
-		d.dbg("dropped stray byte 0x%02X (expected slave 0x%02X)", tmpBuf[0], expectedSlaveID)
-	}
-	if totalRead == 0 {
-		return nil, fmt.Errorf("modbus timeout: no response from slave 0x%02X within %v",
-			expectedSlaveID, requestTimeout)
-	}
-
-	// Phase 1: czytaj do min(exceptionLen, expectedLength) — wystarczy do detekcji exception.
+	// Phase 1: czytaj do min(exceptionLen, expectedLength). Read bez upper
+	// limit na bufie — może zwrócić więcej niż phaseTarget jednym wywołaniem
+	// (cała odpowiedź na raz), Phase 2 wtedy no-op.
 	phaseTarget := exceptionLen
 	if expectedLength < phaseTarget {
 		phaseTarget = expectedLength
 	}
 	for totalRead < phaseTarget && time.Now().Before(deadline) {
-		nRead, err := d.port.Read(response[totalRead:phaseTarget])
+		nRead, err := d.port.Read(response[totalRead:])
 		if err != nil {
 			return nil, fmt.Errorf("failed to read response: %v", err)
 		}
 		if nRead > 0 {
 			totalRead += nRead
+			if !rxMarked {
+				d.stats.markRx()
+				rxMarked = true
+			}
+			continue // może być więcej w buf'ie — od razu retry
 		}
+		time.Sleep(receiveReadDelay)
 	}
 
 	// Exception detection: FC|0x80 (MSB set)
@@ -482,13 +489,15 @@ func (d *ModbusDevice) sendOnce(request []byte, expectedLength int) ([]byte, err
 
 	// Phase 2: dokończ do finalLen
 	for totalRead < finalLen && time.Now().Before(deadline) {
-		nRead, err := d.port.Read(response[totalRead:finalLen])
+		nRead, err := d.port.Read(response[totalRead:])
 		if err != nil {
 			return nil, fmt.Errorf("failed to read response: %v", err)
 		}
 		if nRead > 0 {
 			totalRead += nRead
+			continue
 		}
+		time.Sleep(receiveReadDelay)
 	}
 
 	if totalRead < finalLen {
